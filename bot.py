@@ -1,0 +1,182 @@
+import os
+import json
+import asyncio
+from datetime import datetime
+import discord
+from discord import app_commands
+from discord.ext import commands
+from aiohttp import web
+
+# 🎨 theme configurations
+OREGON_GREEN = discord.Color.from_str("#224D17")
+SAR_ORANGE = discord.Color.from_str("#FF5500")
+
+# 🔐 access control utilities
+def is_whitelisted(user_id: int) -> bool:
+    if not os.path.exists("whitelist.txt"):
+        return False
+    with open("whitelist.txt", "r") as f:
+        allowed_ids = [line.strip() for line in f.readlines()]
+    return str(user_id) in allowed_ids
+
+# 🤖 ai usage tracking core
+def check_and_update_ai_usage(user_id: int, increment: bool = False) -> tuple[int, bool]:
+    """returns (current_count, allowed_to_proceed_immediately)"""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    
+    if os.path.exists("ai_tracker.json") and os.path.getsize("ai_tracker.json") > 0:
+        with open("ai_tracker.json", "r") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = {}
+    else:
+        data = {}
+        
+    if today not in data:
+        data[today] = {}
+        
+    str_uid = str(user_id)
+    current_count = data[today].get(str_uid, 0)
+    
+    if increment:
+        current_count += 1
+        data[today][str_uid] = current_count
+        with open("ai_tracker.json", "w") as f:
+            json.dump(data, f, indent=4)
+            
+    # if they hit 20 or more requests, they need a hard confirmation prompt
+    if current_count >= 20:
+        return current_count, False
+    return current_count, True
+
+# 🚨 confirmation button view for the final 4 requests
+class AiConfirmationView(discord.ui.View):
+    def __init__(self, interaction: discord.Interaction, command_name: str, kwargs: dict):
+        super().__init__(timeout=60)
+        self.interaction = interaction
+        self.command_name = command_name
+        self.kwargs = kwargs
+
+    @discord.ui.button(label="Proceed", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.interaction.user.id:
+            await interaction.response.send_message("this prompt isn't yours.", ephemeral=True)
+            return
+            
+        # increment counter and execute
+        count, _ = check_and_update_ai_usage(interaction.user.id, increment=True)
+        self.stop()
+        
+        # update message to process the logic
+        await interaction.response.edit_message(content="📡 contacting data node... processing ai request.", view=None)
+        # here you would trigger your real gemini api query logic
+        embed = discord.Embed(
+            title="🛰️ telemetry relay: ai processing complete",
+            description=f"simulated ai response for your query.\ncurrent limit: **{count}/24**",
+            color=SAR_ORANGE if count >= 20 else OREGON_GREEN
+        )
+        embed.set_footer(text=f"telemetry: ai usage at {count}/24 for today.")
+        await interaction.followup.send(embed=embed)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="❌ request aborted. daily allowance preserved.", view=None)
+
+# 🌐 koyeb micro-webserver for automated network health checks
+async def web_handle(request):
+    return web.Response(text="relay system online")
+
+async def start_koyeb_health_server():
+    app = web.Application()
+    app.router.add_get('/', web_handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # koyeb automatically assigns a port variable to environment configurations
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+# 🤖 bot configuration
+class SafetyUtilityBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        # hook the background webserver right into discord's main event loop
+        self.loop.create_task(start_koyeb_health_server())
+        await self.tree.sync()
+
+bot = SafetyUtilityBot()
+
+# 🔐 global command check to lock out unverified accounts
+@bot.tree.context_menu(name="check_whitelist")
+async def interaction_check(interaction: discord.Interaction) -> bool:
+    if not is_whitelisted(interaction.user.id):
+        await interaction.response.send_message("❌ identification mismatch. user id not in telemetry database.", ephemeral=True)
+        return False
+    return True
+
+# 🛰️ sample commands structure
+@bot.tree.command(name="datum", description="query structural data parameters from baseline systems")
+@app_commands.choices(source=[
+    app_commands.Choice(name="wikipedia", value="wiki"),
+    app_commands.Choice(name="google", value="google"),
+    app_commands.Choice(name="ai (gemini)", value="ai"),
+    app_commands.Choice(name="dictionary", value="dict")
+])
+async def datum(interaction: discord.Interaction, query: str, source: str):
+    if not is_whitelisted(interaction.user.id):
+        await interaction.response.send_message("❌ access denied.", ephemeral=True)
+        return
+
+    if source == "ai":
+        count, immediate = check_and_update_ai_usage(interaction.user.id, increment=False)
+        if count >= 24:
+            await interaction.response.send_message("🚨 maximum daily operational ceiling reached (24/24). reset occurs at 00:00 utc.", ephemeral=True)
+            return
+            
+        if not immediate:
+            # intercept execution and supply confirmation buttons
+            view = AiConfirmationView(interaction, "datum", {"query": query, "source": source})
+            await interaction.response.send_message(
+                content=f"⚠️ **alert:** you are within your final 4 daily ai allocations ({count}/24). confirm deployment?",
+                view=view,
+                ephemeral=True
+            )
+            return
+            
+        # normal increment if under 20 requests
+        count, _ = check_and_update_ai_usage(interaction.user.id, increment=True)
+        
+        embed = discord.Embed(title="🛰️ datum matrix: ai analysis", description=f"query: {query}\n\n[insert gemini api response code here]", color=OREGON_GREEN)
+        embed.set_footer(text=f"telemetry: ai usage at {count}/24 for today.")
+        await interaction.response.send_message(embed=embed)
+        return
+
+    # non-ai sources handle directly
+    embed = discord.Embed(title=f"🛰️ datum fetch: {source}", description=f"displaying parsed values for: {query}", color=OREGON_GREEN)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="gps", description="coordinating grid system translator")
+async def gps(interaction: discord.Interaction, location: str):
+    if not is_whitelisted(interaction.user.id):
+        await interaction.response.send_message("❌ access denied.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🗺️ geographic coordinate calculation",
+        description=f"**target:** {location}\n**dd:** 44.5646, -123.2620\n**ddm:** 44° 33.876' N, 123° 15.720' W\n**maidenhead:** CN84in",
+        color=OREGON_GREEN
+    )
+    
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="OpenStreetMap", url=f"https://www.openstreetmap.org/search?query={location}"))
+    view.add_item(discord.ui.Button(label="Google Maps", url="https://maps.google.com"))
+    
+    await interaction.response.send_message(embed=embed, view=view)
+
+# trigger execution using environment keys
+bot.run(os.environ.get("DISCORD_TOKEN"))

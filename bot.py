@@ -70,7 +70,6 @@ class AiConfirmationView(discord.ui.View):
         
         # update message to process the logic
         await interaction.response.edit_message(content="📡 contacting data node... processing ai request.", view=None)
-        # here you would trigger your real gemini api query logic
         embed = discord.Embed(
             title="🛰️ telemetry relay: ai processing complete",
             description=f"simulated ai response for your query.\ncurrent limit: **{count}/24**",
@@ -93,7 +92,6 @@ async def start_koyeb_health_server():
     app.router.add_get('/', web_handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    # koyeb automatically assigns a port variable to environment configurations
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
@@ -109,15 +107,21 @@ class SafetyUtilityBot(commands.Bot):
         self.loop.create_task(start_koyeb_health_server())
         await self.tree.sync()
 
+# 🎯 FIXED: instantiating the bot client engine here
 bot = SafetyUtilityBot()
 
 # 🔐 global command check to lock out unverified accounts
-@bot.tree.context_menu(name="check_whitelist")
-async def interaction_check(interaction: discord.Interaction) -> bool:
+async def whitelist_gatekeeper(interaction: discord.Interaction) -> bool:
     if not is_whitelisted(interaction.user.id):
-        await interaction.response.send_message("❌ identification mismatch. user id not in telemetry database.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ identification mismatch. user id not in telemetry database.", 
+            ephemeral=True
+        )
         return False
     return True
+
+# assign it directly to the tree's global check attribute
+bot.tree.interaction_check = whitelist_gatekeeper
 
 # 🛰️ sample commands structure
 @bot.tree.command(name="datum", description="query structural data parameters from baseline systems")
@@ -128,10 +132,6 @@ async def interaction_check(interaction: discord.Interaction) -> bool:
     app_commands.Choice(name="dictionary", value="dict")
 ])
 async def datum(interaction: discord.Interaction, query: str, source: str):
-    if not is_whitelisted(interaction.user.id):
-        await interaction.response.send_message("❌ access denied.", ephemeral=True)
-        return
-
     if source == "ai":
         count, immediate = check_and_update_ai_usage(interaction.user.id, increment=False)
         if count >= 24:
@@ -162,10 +162,6 @@ async def datum(interaction: discord.Interaction, query: str, source: str):
 
 @bot.tree.command(name="gps", description="coordinating grid system translator")
 async def gps(interaction: discord.Interaction, location: str):
-    if not is_whitelisted(interaction.user.id):
-        await interaction.response.send_message("❌ access denied.", ephemeral=True)
-        return
-
     embed = discord.Embed(
         title="🗺️ geographic coordinate calculation",
         description=f"**target:** {location}\n**dd:** 44.5646, -123.2620\n**ddm:** 44° 33.876' N, 123° 15.720' W\n**maidenhead:** CN84in",
@@ -174,9 +170,55 @@ async def gps(interaction: discord.Interaction, location: str):
     
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="OpenStreetMap", url=f"https://www.openstreetmap.org/search?query={location}"))
-    view.add_item(discord.ui.Button(label="Google Maps", url="https://maps.google.com"))
+    view.add_item(discord.ui.Button(label="Google Maps", url=f"https://www.google.com/maps/search/?api=1&query={location}"))
     
     await interaction.response.send_message(embed=embed, view=view)
+
+@bot.tree.command(name="time", description="unified temporal telemetry overview")
+async def time_command(interaction: discord.Interaction):
+    utc_now = datetime.utcnow()
+    embed = discord.Embed(title="🕒 synchronized temporal metrics", color=OREGON_GREEN)
+    embed.add_field(name="🛰️ zulu / utc", value=f"`{utc_now.strftime('%H:%M:%S UTC')}`", inline=False)
+    embed.add_field(name="📅 date matrix", value=f"`{utc_now.strftime('%Y-%m-%d')}`", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="convert", description="tactical backcountry unit and scale translator")
+@app_commands.choices(category=[
+    app_commands.Choice(name="climbing grades (ewbank to yds)", value="climb"),
+    app_commands.Choice(name="elevation (meters to feet)", value="elevation"),
+    app_commands.Choice(name="weight (grams to ounces)", value="weight")
+])
+async def convert(interaction: discord.Interaction, category: str, value: float):
+    embed = discord.Embed(title="📐 physical unit conversion log", color=OREGON_GREEN)
+    
+    if category == "climb":
+        yds_val = "5.9" if value <= 18 else "5.10a"
+        embed.description = f"**input:** ewbank {int(value)}\n**output:** yosemite decimal system (yds) **{yds_val}**"
+    elif category == "elevation":
+        converted = value * 3.28084
+        embed.description = f"**input:** {value} meters\n**output:** {converted:.2f} feet"
+    elif category == "weight":
+        converted = value * 0.035274
+        embed.description = f"**input:** {value} grams\n**output:** {converted:.2f} ounces"
+        
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="trailcalc", description="backcountry speed, metabolic, and hydration metrics")
+async def trailcalc(interaction: discord.Interaction, distance_km: float, elevation_gain_m: float, pack_weight_kg: float):
+    moving_hours = (distance_km / 5.0) + (elevation_gain_m / 600.0)
+    water_liters = moving_hours * 0.5
+    calories = int(moving_hours * 450)
+    
+    embed = discord.Embed(
+        title="🥾 logistical route projection",
+        description=f"**metrics calculated for a pack weight of {pack_weight_kg} kg:**",
+        color=OREGON_GREEN
+    )
+    embed.add_field(name="⏱️ moving duration (naismith's rule)", value=f"`{moving_hours:.2f} hours`", inline=True)
+    embed.add_field(name="💧 min hydration volume", value=f"`{water_liters:.2f} liters`", inline=True)
+    embed.add_field(name="🔥 estimated caloric cost", value=f"`{calories} kcal`", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
 
 # trigger execution using environment keys
 bot.run(os.environ.get("DISCORD_TOKEN"))

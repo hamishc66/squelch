@@ -3,7 +3,8 @@ import json
 import math
 import os
 import urllib.parse
-from datetime import datetime, timezone
+from io import BytesIO
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,13 +12,19 @@ import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+from pypdf import PdfReader
 
 
 BASE_DIR = Path(__file__).resolve().parent
 WHITELIST_PATH = BASE_DIR / "whitelist.txt"
 AI_TRACKER_PATH = BASE_DIR / "ai_tracker.json"
 COMMS_HISTORY_PATH = BASE_DIR / "comms_history.txt"
+MODE_STATE_PATH = BASE_DIR / "mode_state.json"
+THEME_STATE_PATH = BASE_DIR / "theme_state.json"
+REMINDERS_PATH = BASE_DIR / "reminders.json"
+DEADROPS_PATH = BASE_DIR / "deadrops.json"
+BLACKBOX_LOG_PATH = BASE_DIR / "blackbox.log"
 PORT = int(os.getenv("PORT", "8080"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
@@ -27,6 +34,120 @@ SAR_ORANGE = discord.Color.from_rgb(255, 85, 0)
 
 AI_WARNING_FOOTER = "⚠️ Telemetry: AI usage at {count}/24 for today."
 AI_LIMIT = 24
+DEFAULT_THEME_ID = "ranger"
+VALID_MODES = ("regular", "stealth", "blackbox")
+
+THEME_PRESETS = [
+	{
+		"id": "ranger",
+		"label": "Normal Ranger",
+		"emoji": "🟩",
+		"color": discord.Color.from_rgb(34, 77, 23),
+		"persona": "You are a calm, competent backcountry ranger. Be practical, clear, and reliable. Favor concise field notes and operational clarity.",
+		"accent": "forest",
+	},
+	{
+		"id": "rugged",
+		"label": "Rugged",
+		"emoji": "🪵",
+		"color": discord.Color.from_rgb(92, 64, 51),
+		"persona": "You are a rugged trail veteran. Speak plainly, keep details durable and field-tested, and avoid fluff.",
+		"accent": "earth",
+	},
+	{
+		"id": "preppy",
+		"label": "Preppy",
+		"emoji": "✨",
+		"color": discord.Color.from_rgb(255, 105, 180),
+		"persona": "You are upbeat, polished, and stylish. Keep the tone energetic and supportive while staying useful.",
+		"accent": "rose",
+	},
+	{
+		"id": "pride",
+		"label": "Pride",
+		"emoji": "🏳️‍🌈",
+		"color": discord.Color.from_rgb(255, 80, 120),
+		"persona": "You are warm, affirming, and inclusive. Stay encouraging, direct, and celebratory without getting saccharine.",
+		"accent": "pride",
+	},
+	{
+		"id": "alpine",
+		"label": "Alpine",
+		"emoji": "🏔️",
+		"color": discord.Color.from_rgb(68, 110, 165),
+		"persona": "You are high-elevation, crisp, and cool-headed. Use clean mountain ops language and a steady voice.",
+		"accent": "ice",
+	},
+	{
+		"id": "night_ops",
+		"label": "Night Ops",
+		"emoji": "🌙",
+		"color": discord.Color.from_rgb(30, 34, 62),
+		"persona": "You are low-light, stealthy, and deliberate. Keep responses compact, sharp, and tactical.",
+		"accent": "midnight",
+	},
+	{
+		"id": "radio_gear",
+		"label": "Radio Gear",
+		"emoji": "📻",
+		"color": discord.Color.from_rgb(224, 133, 0),
+		"persona": "You are a meticulous radio operator. Think in frequencies, signal paths, antenna setup, and concise comms discipline.",
+		"accent": "amber",
+	},
+	{
+		"id": "trail_medic",
+		"label": "Trail Medic",
+		"emoji": "⛑️",
+		"color": discord.Color.from_rgb(170, 42, 42),
+		"persona": "You are a calm EMT-minded trail medic. Prioritize safety, scene awareness, and simple field triage language. Never diagnose.",
+		"accent": "red",
+	},
+	{
+		"id": "fire_lookout",
+		"label": "Fire Lookout",
+		"emoji": "🔥",
+		"color": discord.Color.from_rgb(184, 74, 24),
+		"persona": "You are an observant fire lookout. Be vigilant, concise, and detail oriented with weather, smoke, and terrain awareness.",
+		"accent": "ember",
+	},
+	{
+		"id": "storm_watch",
+		"label": "Storm Watch",
+		"emoji": "⛈️",
+		"color": discord.Color.from_rgb(56, 92, 140),
+		"persona": "You are a weather watcher tracking pressure, cloud cover, and storm timing. Respond with crisp forecasts and alert language.",
+		"accent": "storm",
+	},
+]
+
+THEME_BY_ID = {theme["id"]: theme for theme in THEME_PRESETS}
+THEME_OPTIONS = [app_commands.Choice(name=theme["label"], value=theme["id"]) for theme in THEME_PRESETS]
+RED_FLAG_KEYWORDS = {
+	"chest pain",
+	"shortness of breath",
+	"sob",
+	"unresponsive",
+	"altered mental",
+	"stroke",
+	"facial droop",
+	"slurred speech",
+	"seizure",
+	"seizing",
+	"major bleed",
+	"massive bleeding",
+	"anaphylaxis",
+	"shock",
+	"burn",
+	"airway",
+	"cyanosis",
+}
+
+_MODE_STATE_CACHE: Dict[str, Any] = {}
+_THEME_STATE_CACHE: Dict[str, Any] = {}
+_REMINDERS_STATE_CACHE: Dict[str, Any] = {}
+_DEADROPS_STATE_CACHE: Dict[str, Any] = {}
+_BLACKBOX_CHANNELS: set = set()
+PERSISTENCE_LOCK = asyncio.Lock()
 
 
 def utc_now() -> datetime:
@@ -192,6 +313,12 @@ def save_json_file(path: Path, payload: Dict[str, Any]) -> None:
 	os.replace(str(temp_path), str(path))
 
 
+_MODE_STATE_CACHE = load_json_file(MODE_STATE_PATH)
+_THEME_STATE_CACHE = load_json_file(THEME_STATE_PATH)
+_REMINDERS_STATE_CACHE = load_json_file(REMINDERS_PATH)
+_DEADROPS_STATE_CACHE = load_json_file(DEADROPS_PATH)
+
+
 def load_whitelist() -> List[int]:
 	if not WHITELIST_PATH.exists():
 		return []
@@ -278,6 +405,374 @@ def ai_footer(count: int) -> str:
 
 def ai_footer_color(count: int) -> discord.Color:
 	return OREGON_GREEN if count <= 20 else SAR_ORANGE
+
+
+def load_mapping_state(path: Path) -> Dict[str, Any]:
+	data = load_json_file(path)
+	return data if isinstance(data, dict) else {}
+
+
+def normalize_simple_state(store: Dict[str, Any], default_value: str) -> Dict[str, str]:
+	result: Dict[str, str] = {}
+	for key, value in store.items():
+		if isinstance(value, str):
+			result[str(key)] = value
+		else:
+			result[str(key)] = default_value
+	return result
+
+
+def get_user_mode(user_id: int) -> str:
+	return normalize_simple_state(_MODE_STATE_CACHE, "regular").get(str(user_id), "regular")
+
+
+def get_user_theme(user_id: int) -> Dict[str, Any]:
+	theme_id = normalize_simple_state(_THEME_STATE_CACHE, DEFAULT_THEME_ID).get(str(user_id), DEFAULT_THEME_ID)
+	return THEME_BY_ID.get(theme_id, THEME_BY_ID[DEFAULT_THEME_ID])
+
+
+async def set_user_mode(user_id: int, mode: str) -> None:
+	_MODE_STATE_CACHE[str(user_id)] = mode
+	async with PERSISTENCE_LOCK:
+		save_state(MODE_STATE_PATH, _MODE_STATE_CACHE)
+
+
+async def set_user_theme(user_id: int, theme_id: str) -> None:
+	_THEME_STATE_CACHE[str(user_id)] = theme_id
+	async with PERSISTENCE_LOCK:
+		save_state(THEME_STATE_PATH, _THEME_STATE_CACHE)
+
+
+def get_mode_label(user_id: int) -> str:
+	return get_user_mode(user_id).title()
+
+
+def user_is_blackbox(user_id: int) -> bool:
+	return get_user_mode(user_id) == "blackbox"
+
+
+def should_ephemeral(user_id: int) -> bool:
+	return get_user_mode(user_id) == "stealth"
+
+
+def compose_ai_prompt(user_id: int, prompt: str, purpose: str) -> str:
+	theme = get_user_theme(user_id)
+	return (
+		f"SYSTEM THEME: {theme['label']}\n"
+		f"AI PERSONA: {theme['persona']}\n"
+		f"OPERATIONAL PURPOSE: {purpose}\n"
+		"Response style: clean markdown, field-usable, practical, concise where appropriate.\n\n"
+		f"USER REQUEST:\n{prompt}"
+	)
+
+
+def payload_preview(content: Optional[str] = None, embed: Optional[discord.Embed] = None) -> str:
+	if content:
+		return truncate_text(clean_text(content), 280)
+	if embed:
+		parts = [part for part in [embed.title, embed.description] if part]
+		return truncate_text(" | ".join(parts), 280)
+	return ""
+
+
+async def write_blackbox_log(line: str) -> None:
+	print(line)
+	async with PERSISTENCE_LOCK:
+		with BLACKBOX_LOG_PATH.open("a", encoding="utf-8") as handle:
+			handle.write(line + "\n")
+
+
+async def log_blackbox_event(interaction: discord.Interaction, event: str, details: str) -> None:
+	if get_user_mode(interaction.user.id) != "blackbox":
+		return
+	channel_label = f"channel={getattr(interaction.channel, 'id', 'dm')}"
+	guild_label = f"guild={interaction.guild_id or 'dm'}"
+	user_label = f"user={interaction.user.id}"
+	await write_blackbox_log(
+		f"[{utc_now().isoformat()}] {event} {user_label} {guild_label} {channel_label} :: {truncate_text(details, 800)}"
+	)
+	if interaction.channel_id is not None:
+		_BLACKBOX_CHANNELS.add(interaction.channel_id)
+
+
+async def log_blackbox_message(message: discord.Message) -> None:
+	if message.channel.id not in _BLACKBOX_CHANNELS:
+		return
+	if message.author.bot:
+		return
+	await write_blackbox_log(
+		f"[{utc_now().isoformat()}] message user={message.author.id} channel={message.channel.id} :: {truncate_text(message.content or '', 800)}"
+	)
+
+
+def current_visibility(user_id: int) -> bool:
+	return get_user_mode(user_id) in {"stealth", "blackbox"}
+
+
+async def mode_send(interaction: discord.Interaction, *, content: Optional[str] = None, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None, file: Optional[discord.File] = None, ephemeral: Optional[bool] = None) -> None:
+	should_ephemeral = current_visibility(interaction.user.id) if ephemeral is None else ephemeral
+	if get_user_mode(interaction.user.id) == "blackbox":
+		await write_blackbox_log(
+			f"[{utc_now().isoformat()}] response user={interaction.user.id} :: {payload_preview(content, embed)}"
+		)
+	if interaction.response.is_done():
+		await interaction.followup.send(content=content, embed=embed, view=view, file=file, ephemeral=should_ephemeral)
+	else:
+		await interaction.response.send_message(content=content, embed=embed, view=view, file=file, ephemeral=should_ephemeral)
+
+
+def normalize_reminders_state(store: Any) -> Dict[str, Any]:
+	if not isinstance(store, dict):
+		return {"items": [], "next_id": 1}
+	items = store.get("items")
+	if not isinstance(items, list):
+		items = []
+	next_id = store.get("next_id", 1)
+	try:
+		next_id = int(next_id)
+	except (TypeError, ValueError):
+		next_id = 1
+	return {"items": items, "next_id": max(1, next_id)}
+
+
+def normalize_deadrops_state(store: Any) -> Dict[str, Any]:
+	if not isinstance(store, dict):
+		return {"items": [], "next_id": 1}
+	items = store.get("items")
+	if not isinstance(items, list):
+		items = []
+	next_id = store.get("next_id", 1)
+	try:
+		next_id = int(next_id)
+	except (TypeError, ValueError):
+		next_id = 1
+	return {"items": items, "next_id": max(1, next_id)}
+
+
+def save_state(path: Path, payload: Any) -> None:
+	save_json_file(path, payload)
+
+
+def theme_card(theme: Dict[str, Any]) -> str:
+	return f"{theme['emoji']} {theme['label']}"
+
+
+def attachment_suffix(attachment: discord.Attachment) -> str:
+	filename = attachment.filename.lower()
+	if filename.endswith(".md") or filename.endswith(".markdown"):
+		return "md"
+	if filename.endswith(".pdf"):
+		return "pdf"
+	if filename.endswith(".txt"):
+		return "txt"
+	return filename.rsplit(".", 1)[-1] if "." in filename else ""
+
+
+async def extract_attachment_text(attachment: discord.Attachment) -> Tuple[bool, str]:
+	data = await attachment.read()
+	extension = attachment_suffix(attachment)
+	if extension == "pdf":
+		try:
+			reader = PdfReader(BytesIO(data))
+			parts: List[str] = []
+			for page in reader.pages:
+				parts.append(page.extract_text() or "")
+			return True, "\n".join(parts).strip()
+		except Exception as exc:
+			return False, f"Failed to parse PDF: {exc}"
+	try:
+		return True, data.decode("utf-8", errors="ignore")
+	except Exception as exc:
+		return False, f"Failed to read attachment: {exc}"
+
+
+def study_system_prompt(theme: Dict[str, Any]) -> str:
+	return (
+		f"You are Squelch Study Ops in the {theme['label']} theme. {theme['persona']}\n"
+		"Act as a study coach for Obsidian and field notes. Produce markdown only with these sections: Summary, Key Terms, Flashcards, Quick Quiz, Memory Hooks, Next Review.\n"
+		"Keep it accurate, concise, and practical. If source notes are provided, use them heavily. Do not hallucinate citations."
+	)
+
+
+def reminder_state() -> Dict[str, Any]:
+	global _REMINDERS_STATE_CACHE
+	_REMINDERS_STATE_CACHE = normalize_reminders_state(_REMINDERS_STATE_CACHE)
+	return _REMINDERS_STATE_CACHE
+
+
+def deadrop_state() -> Dict[str, Any]:
+	global _DEADROPS_STATE_CACHE
+	_DEADROPS_STATE_CACHE = normalize_deadrops_state(_DEADROPS_STATE_CACHE)
+	return _DEADROPS_STATE_CACHE
+
+
+def reminder_label(record: Dict[str, Any]) -> str:
+	due_at = record.get("due_at", "")
+	note = record.get("note", "")
+	return f"#{record.get('id', '?')} • {due_at} • {note}"
+
+
+def classify_triage(query: str) -> Tuple[str, str]:
+	text = clean_text(query).lower()
+	if any(keyword in text for keyword in ["gps", "location", "address", "lat", "lon", "coordinate", "coords"]):
+		return "navigation", "Use `/gps` for coordinates and routing links."
+	if any(keyword in text for keyword in ["weather", "rain", "storm", "wind", "forecast", "pressure"]):
+		return "weather", "Use `/weather` for meteorology comparison."
+	if any(keyword in text for keyword in ["radio", "repeater", "vhf", "uhf", "comms", "signal"]):
+		return "comms", "Use `/repeater` or `/commslog` for radio operations and logging."
+	if any(keyword in text for keyword in ["convert", "grams", "meters", "liters", "aud", "ewbank"]):
+		return "conversion", "Use `/convert` for unit work."
+	if any(keyword in text for keyword in ["study", "notes", "quiz", "flashcard", "obsidian", "pdf", "markdown", ".md"]):
+		return "study", "Use `/study` to turn notes or files into a study pack."
+	if any(keyword in text for keyword in ["remind", "later", "deadline", "alarm"]):
+		return "reminders", "Use `/reminders` to create or manage reminders."
+	if any(keyword in text for keyword in ["deadrop", "drop", "secret", "stash"]):
+		return "deadrop", "Use `/deadrop` to store or retrieve a secret note."
+	if any(keyword in text for keyword in ["med", "injury", "pain", "breath", "bleeding", "trauma", "triage"]):
+		return "medical", "Use `/fieldmed` for safety-first field triage prompts."
+	if any(keyword in text for keyword in ["ai", "summarize", "explain", "write", "analyze"]):
+		return "ai", "Use `/ai` for general Gemini help."
+	return "general", "No strong route found. `/ai` or `/study` may be the best starting point."
+
+
+def medical_red_flags(text: str) -> List[str]:
+	lower = text.lower()
+	flags: List[str] = []
+	for keyword in RED_FLAG_KEYWORDS:
+		if keyword in lower:
+			flags.append(keyword)
+	return flags
+
+
+class ThemePickerSelect(discord.ui.Select):
+	def __init__(self, owner_id: int):
+		options = [
+			discord.SelectOption(
+				label=theme["label"],
+				value=theme_id,
+				emoji=theme["emoji"],
+				description=theme["persona"][:95],
+			)
+			for theme_id, theme in THEME_BY_ID.items()
+		]
+		super().__init__(placeholder="Choose a mission skin...", options=options, min_values=1, max_values=1)
+		self.owner_id = owner_id
+
+	async def callback(self, interaction: discord.Interaction) -> None:
+		if interaction.user.id != self.owner_id:
+			await interaction.response.send_message("This picker belongs to someone else.", ephemeral=True)
+			return
+		theme_id = self.values[0]
+		await set_user_theme(interaction.user.id, theme_id)
+		theme = THEME_BY_ID.get(theme_id, THEME_BY_ID[DEFAULT_THEME_ID])
+		embed = make_embed(
+			f"THEME LOCKED: {theme['label']}",
+			f"Selected theme: {theme_card(theme)}\n\nAI persona and response style are now synced to this preset.",
+			theme["color"],
+		)
+		await interaction.response.edit_message(embed=embed, view=self.view)
+		await log_blackbox_event(interaction, "theme", f"{theme_id}")
+
+
+class ThemePickerView(discord.ui.View):
+	def __init__(self, owner_id: int):
+		super().__init__(timeout=180)
+		self.add_item(ThemePickerSelect(owner_id))
+
+
+def reminder_embed(record: Dict[str, Any]) -> discord.Embed:
+	return make_embed(
+		"REMINDER DUE",
+		f"**Note:** {record.get('note', '')}\n**Due:** {record.get('due_at', '')}\n**Reminder ID:** `{record.get('id', '?')}`",
+		OREGON_GREEN,
+	)
+
+
+@tasks.loop(seconds=30)
+async def reminder_dispatch() -> None:
+	state = reminder_state()
+	items = state.get("items", [])
+	now = utc_now()
+	changed = False
+	for record in items:
+		if not isinstance(record, dict) or record.get("sent"):
+			continue
+		due_at = record.get("due_at", "")
+		try:
+			due_time = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+		except Exception:
+			continue
+		if due_time > now:
+			continue
+		user = bot.get_user(int(record.get("user_id", 0)))
+		channel_id = record.get("channel_id")
+		embed = reminder_embed(record)
+		try:
+			sent = False
+			if user is not None:
+				try:
+					await user.send(embed=embed)
+					sent = True
+				except Exception:
+					pass
+			if not sent and channel_id is not None:
+				channel = bot.get_channel(int(channel_id))
+				if channel is not None:
+					await channel.send(embed=embed)
+					sent = True
+			if not sent:
+				continue
+			record["sent"] = True
+			record["sent_at"] = utc_now().isoformat()
+			changed = True
+			await write_blackbox_log(f"[{utc_now().isoformat()}] reminder-firing id={record.get('id')} user={record.get('user_id')} note={truncate_text(str(record.get('note', '')), 120)}")
+		except Exception as exc:
+			await write_blackbox_log(f"[{utc_now().isoformat()}] reminder-error id={record.get('id')} error={exc}")
+	if changed:
+		async with PERSISTENCE_LOCK:
+			save_state(REMINDERS_PATH, state)
+
+
+def parse_reminder_minutes(minutes: float) -> str:
+	return (utc_now() + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+
+
+def build_study_source_text(filename: str, source_text: str) -> str:
+	return f"SOURCE FILE: {filename}\n\n{source_text.strip()}"
+
+
+def triage_summary_embed(category: str, recommendation: str, query: str) -> discord.Embed:
+	return make_embed(
+		f"TRIAGE: {category.upper()}",
+		f"**Input:** {query}\n\n**Route:** {recommendation}",
+		OREGON_GREEN,
+	)
+
+
+def fieldmed_report(chief_complaint: str, age: Optional[int], vitals: Optional[str], mechanism: Optional[str]) -> discord.Embed:
+	flags = medical_red_flags(chief_complaint + " " + (vitals or "") + " " + (mechanism or ""))
+	red_flag_text = ", ".join(flags) if flags else "none obvious from keywords"
+	assessment_lines = [
+		"- Scene safety and PPE",
+		"- Determine responsiveness and airway/breathing/circulation",
+		"- Check for major hemorrhage, stroke signs, and altered mental status",
+		"- Obtain set of vitals and trend them if available",
+		"- Escalate if there is chest pain, respiratory distress, uncontrolled bleeding, seizure activity, or shock signs",
+	]
+	if age is not None and age < 18:
+		assessment_lines.append("- Pediatric considerations apply; monitor closely and involve appropriate transport/escalation")
+	description = (
+		f"**Chief Complaint:** {chief_complaint}\n"
+		f"**Age:** {age if age is not None else 'not provided'}\n"
+		f"**Vitals:** {vitals or 'not provided'}\n"
+		f"**Mechanism:** {mechanism or 'not provided'}\n\n"
+		f"**Keyword Red Flags:** {red_flag_text}\n\n"
+		"**Field Checklist**\n" + "\n".join(assessment_lines) + "\n\n"
+		"**Note:** This helper is safety-focused only and does not diagnose."
+	)
+	color = SAR_ORANGE if flags else OREGON_GREEN
+	embed = make_embed("FIELD MED TRIAGE", description, color)
+	return embed
 
 
 def open_meteo_current_url(latitude: float, longitude: float, model: str) -> str:
@@ -535,12 +1030,15 @@ class MapsView(discord.ui.View):
 class SquelchBot(commands.Bot):
 	def __init__(self) -> None:
 		intents = discord.Intents.default()
+		intents.message_content = True
 		super().__init__(command_prefix="/", intents=intents)
 		self.http_runner: Optional[web.AppRunner] = None
 		self.http_site: Optional[web.TCPSite] = None
 
 	async def setup_hook(self) -> None:
 		await self._start_web_server()
+		if not reminder_dispatch.is_running():
+			reminder_dispatch.start()
 		await self.tree.sync()
 
 	async def close(self) -> None:
@@ -597,6 +1095,300 @@ async def fetch_json_with_headers(url: str, headers: Dict[str, str]) -> Tuple[in
 			return response.status, payload, text
 
 
+@bot.tree.command(name="mode", description="Switch your local Squelch operating mode.")
+@app_commands.describe(mode="Pick regular, stealth, or blackbox.")
+@app_commands.choices(mode=[
+	app_commands.Choice(name="regular", value="regular"),
+	app_commands.Choice(name="stealth", value="stealth"),
+	app_commands.Choice(name="blackbox", value="blackbox"),
+])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def mode_command(interaction: discord.Interaction, mode: app_commands.Choice[str]) -> None:
+	previous_mode = get_user_mode(interaction.user.id)
+	await set_user_mode(interaction.user.id, mode.value)
+	description = (
+		f"Mode updated from **{previous_mode}** to **{mode.value}**.\n\n"
+		"regular = normal responses\n"
+		"stealth = private responses\n"
+		"blackbox = private responses plus local logging to console and blackbox.log"
+	)
+	await mode_send(interaction, embed=make_embed("MODE UPDATED", description, OREGON_GREEN), ephemeral=mode.value != "regular")
+	if mode.value == "blackbox" or previous_mode == "blackbox":
+		if interaction.channel_id is not None and mode.value == "blackbox":
+			_BLACKBOX_CHANNELS.add(interaction.channel_id)
+		await write_blackbox_log(
+			f"[{utc_now().isoformat()}] mode user={interaction.user.id} from={previous_mode} to={mode.value}"
+		)
+
+
+@bot.tree.command(name="theme", description="Open the Squelch theme picker.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def theme_command(interaction: discord.Interaction) -> None:
+	theme = get_user_theme(interaction.user.id)
+	embed = make_embed(
+		f"THEME DESK: {theme['label']}",
+		f"Current theme: {theme_card(theme)}\n\nPick a new persona from the menu below. The selected theme changes AI tone and study-helper style.",
+		theme["color"],
+	)
+	await mode_send(interaction, embed=embed, view=ThemePickerView(interaction.user.id), ephemeral=True)
+
+
+@bot.tree.command(name="reminders", description="Create, list, update, or clear a reminder.")
+@app_commands.describe(
+	action="Pick add, list, done, or delete.",
+	minutes="Minutes from now for add.",
+	note="Reminder text for add.",
+	reminder_id="Reminder ID for done or delete.",
+)
+@app_commands.choices(action=[
+	app_commands.Choice(name="add", value="add"),
+	app_commands.Choice(name="list", value="list"),
+	app_commands.Choice(name="done", value="done"),
+	app_commands.Choice(name="delete", value="delete"),
+])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def reminders_command(
+	interaction: discord.Interaction,
+	action: app_commands.Choice[str],
+	minutes: Optional[int] = None,
+	note: Optional[str] = None,
+	reminder_id: Optional[int] = None,
+) -> None:
+	state = reminder_state()
+	items = state["items"]
+	user_id = interaction.user.id
+	action_value = action.value
+
+	if action_value == "add":
+		if minutes is None or minutes <= 0:
+			await mode_send(interaction, content="Provide a positive number of minutes for the reminder.", ephemeral=True)
+			return
+		if not note:
+			await mode_send(interaction, content="Provide reminder text for the add action.", ephemeral=True)
+			return
+		record = {
+			"id": state["next_id"],
+			"user_id": user_id,
+			"note": clean_text(note),
+			"due_at": (utc_now() + timedelta(minutes=minutes)).isoformat(),
+			"channel_id": interaction.channel_id,
+			"created_at": utc_now().isoformat(),
+			"sent": False,
+		}
+		state["next_id"] += 1
+		items.append(record)
+		async with PERSISTENCE_LOCK:
+			save_state(REMINDERS_PATH, state)
+		await mode_send(interaction, embed=make_embed("REMINDER STAGED", f"Reminder #{record['id']} scheduled for {record['due_at']}\n\n{record['note']}", OREGON_GREEN))
+		return
+
+	user_items = [record for record in items if isinstance(record, dict) and int(record.get("user_id", 0)) == user_id and not record.get("deleted")]
+
+	if action_value == "list":
+		if not user_items:
+			await mode_send(interaction, content="No active reminders.", ephemeral=True)
+			return
+		lines = [reminder_label(record) for record in sorted(user_items, key=lambda entry: entry.get("id", 0))]
+		await mode_send(interaction, embed=make_embed("REMINDERS", "\n".join(lines), OREGON_GREEN), ephemeral=True)
+		return
+
+	if reminder_id is None:
+		await mode_send(interaction, content="Provide a reminder ID for that action.", ephemeral=True)
+		return
+
+	match = None
+	for record in user_items:
+		if int(record.get("id", 0)) == reminder_id:
+			match = record
+			break
+
+	if match is None:
+		await mode_send(interaction, content="Reminder not found.", ephemeral=True)
+		return
+
+	if action_value == "done":
+		match["done"] = True
+		match["done_at"] = utc_now().isoformat()
+	elif action_value == "delete":
+		match["deleted"] = True
+		match["deleted_at"] = utc_now().isoformat()
+
+	async with PERSISTENCE_LOCK:
+		save_state(REMINDERS_PATH, state)
+	await mode_send(interaction, embed=make_embed("REMINDER UPDATED", f"Reminder #{reminder_id} marked **{action_value}**.", OREGON_GREEN))
+
+
+@bot.tree.command(name="deadrop", description="Store, retrieve, list, or remove a dead drop note.")
+@app_commands.describe(
+	action="Pick create, retrieve, list, or delete.",
+	key="Dead drop key name.",
+	content="Secret content for create.",
+	secret="Optional retrieval or deletion passphrase.",
+	deadrop_id="Numeric dead drop ID for delete.",
+)
+@app_commands.choices(action=[
+	app_commands.Choice(name="create", value="create"),
+	app_commands.Choice(name="retrieve", value="retrieve"),
+	app_commands.Choice(name="list", value="list"),
+	app_commands.Choice(name="delete", value="delete"),
+])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def deadrop_command(
+	interaction: discord.Interaction,
+	action: app_commands.Choice[str],
+	key: Optional[str] = None,
+	content: Optional[str] = None,
+	secret: Optional[str] = None,
+	deadrop_id: Optional[int] = None,
+) -> None:
+	state = deadrop_state()
+	items = state["items"]
+	action_value = action.value
+	user_id = interaction.user.id
+
+	if action_value == "create":
+		if not key or not content:
+			await mode_send(interaction, content="Provide both key and content for a deadrop.", ephemeral=True)
+			return
+		record = {
+			"id": state["next_id"],
+			"user_id": user_id,
+			"key": clean_text(key),
+			"content": content,
+			"secret": clean_text(secret or ""),
+			"created_at": utc_now().isoformat(),
+			"deleted": False,
+		}
+		state["next_id"] += 1
+		items.append(record)
+		async with PERSISTENCE_LOCK:
+			save_state(DEADROPS_PATH, state)
+		await mode_send(interaction, embed=make_embed("DEADROP CREATED", f"Stored `{record['key']}` as deadrop #{record['id']}.", OREGON_GREEN), ephemeral=True)
+		return
+
+	active_items = [record for record in items if isinstance(record, dict) and not record.get("deleted")]
+
+	if action_value == "list":
+		if not active_items:
+			await mode_send(interaction, content="No dead drops stored.", ephemeral=True)
+			return
+		lines = [f"#{record.get('id', '?')} • {record.get('key', '')}" for record in active_items]
+		await mode_send(interaction, embed=make_embed("DEADROP INDEX", "\n".join(lines), OREGON_GREEN), ephemeral=True)
+		return
+
+	if action_value == "retrieve":
+		match = None
+		for record in active_items:
+			if key and clean_text(record.get("key", "")).lower() == clean_text(key).lower():
+				match = record
+				break
+			if deadrop_id is not None and int(record.get("id", 0)) == deadrop_id:
+				match = record
+				break
+		if match is None:
+			await mode_send(interaction, content="Dead drop not found.", ephemeral=True)
+			return
+		stored_secret = clean_text(match.get("secret", ""))
+		if stored_secret and stored_secret != clean_text(secret or ""):
+			await mode_send(interaction, content="Secret mismatch.", ephemeral=True)
+			return
+		await mode_send(interaction, embed=make_embed(f"DEADROP #{match.get('id', '?')}", match.get("content", ""), OREGON_GREEN), ephemeral=True)
+		return
+
+	if action_value == "delete":
+		if deadrop_id is None:
+			await mode_send(interaction, content="Provide a deadrop ID to delete.", ephemeral=True)
+			return
+		match = None
+		for record in active_items:
+			if int(record.get("id", 0)) == deadrop_id:
+				match = record
+				break
+		if match is None:
+			await mode_send(interaction, content="Dead drop not found.", ephemeral=True)
+			return
+		stored_secret = clean_text(match.get("secret", ""))
+		if stored_secret and stored_secret != clean_text(secret or ""):
+			await mode_send(interaction, content="Secret mismatch.", ephemeral=True)
+			return
+		match["deleted"] = True
+		match["deleted_at"] = utc_now().isoformat()
+		async with PERSISTENCE_LOCK:
+			save_state(DEADROPS_PATH, state)
+		await mode_send(interaction, content=f"Deadrop #{deadrop_id} deleted.", ephemeral=True)
+
+
+@bot.tree.command(name="triage", description="Classify a task or request into the best local route.")
+@app_commands.describe(query="Describe what you need routed.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def triage_command(interaction: discord.Interaction, query: str) -> None:
+	category, recommendation = classify_triage(query)
+	embed = triage_summary_embed(category, recommendation, query)
+	await mode_send(interaction, embed=embed, ephemeral=current_visibility(interaction.user.id))
+
+
+@bot.tree.command(name="study", description="Turn a note, PDF, or topic into a study pack.")
+@app_commands.describe(topic="What you want to study.", source="Optional .md or PDF attachment.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def study_command(interaction: discord.Interaction, topic: str, source: Optional[discord.Attachment] = None) -> None:
+	theme = get_user_theme(interaction.user.id)
+	await interaction.response.defer(ephemeral=current_visibility(interaction.user.id))
+	source_block = ""
+	if source is not None:
+		ok, extracted = await extract_attachment_text(source)
+		if not ok:
+			await interaction.followup.send(embed=make_embed("STUDY ERROR", extracted, SAR_ORANGE), ephemeral=True)
+			return
+		if not extracted.strip():
+			await interaction.followup.send(embed=make_embed("STUDY ERROR", "The attached file did not yield readable text.", SAR_ORANGE), ephemeral=True)
+			return
+		source_block = build_study_source_text(source.filename, extracted)
+	prompt = compose_ai_prompt(
+		interaction.user.id,
+		f"{study_system_prompt(theme)}\n\nCreate a study pack for the topic below. Include an overview, flashcards, and a short quiz.\n\nTOPIC: {topic}\n\nSOURCE NOTES:\n{source_block or 'No attachment provided. Use the topic and general best practices only.'}",
+		"study helper",
+	)
+	success, output = await gemini_generate(prompt)
+	if not success:
+		await interaction.followup.send(embed=make_embed("STUDY ERROR", truncate_text(output, 3900), SAR_ORANGE), ephemeral=True)
+		return
+	embed = make_embed(f"STUDY PACK: {topic}", truncate_text(output, 3900), theme["color"])
+	await interaction.followup.send(embed=embed, ephemeral=current_visibility(interaction.user.id))
+
+
+@bot.tree.command(name="fieldmed", description="Field triage helper for EMT-style safety checks.")
+@app_commands.describe(
+	chief_complaint="What happened.",
+	age="Optional patient age.",
+	vitals="Optional vitals string.",
+	mechanism="Optional mechanism of injury or illness.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def fieldmed_command(
+	interaction: discord.Interaction,
+	chief_complaint: str,
+	age: Optional[int] = None,
+	vitals: Optional[str] = None,
+	mechanism: Optional[str] = None,
+) -> None:
+	embed = fieldmed_report(chief_complaint, age, vitals, mechanism)
+	await mode_send(interaction, embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="datum", description="Multi-node technical search and research discovery tool.")
 @app_commands.choices(source=[
 	app_commands.Choice(name="wikipedia", value="wikipedia"),
@@ -611,24 +1403,25 @@ async def fetch_json_with_headers(url: str, headers: Dict[str, str]) -> Tuple[in
 async def datum_cmd(interaction: discord.Interaction, query: str, source: app_commands.Choice[str]) -> None:
 	selected = source.value
 	query = clean_text(query)
-	await interaction.response.defer()
+	private = current_visibility(interaction.user.id)
+	await interaction.response.defer(ephemeral=private)
 
 	if selected == "google":
 		embed = make_embed("DATUM: GOOGLE ROUTE", f"[Open Google search]({google_search_url(query)})", OREGON_GREEN)
 		view = DepthSourcesView(google_search_url(query), query)
-		await interaction.followup.send(embed=embed, view=view)
+		await interaction.followup.send(embed=embed, view=view, ephemeral=private)
 		return
 
 	if selected == "wolfram":
 		embed = make_embed("DATUM: WOLFRAM ROUTE", f"[Open WolframAlpha]({wolfram_url(query)})", OREGON_GREEN)
 		view = DepthSourcesView(wolfram_url(query), query)
-		await interaction.followup.send(embed=embed, view=view)
+		await interaction.followup.send(embed=embed, view=view, ephemeral=private)
 		return
 
 	if selected == "stack":
 		embed = make_embed("DATUM: STACK OVERFLOW ROUTE", f"[Open Stack Overflow search]({stackoverflow_url(query)})", OREGON_GREEN)
 		view = DepthSourcesView(stackoverflow_url(query), query)
-		await interaction.followup.send(embed=embed, view=view)
+		await interaction.followup.send(embed=embed, view=view, ephemeral=private)
 		return
 
 	if selected == "wikipedia":
@@ -638,17 +1431,18 @@ async def datum_cmd(interaction: discord.Interaction, query: str, source: app_co
 		if status != 200 or not isinstance(payload, dict):
 			embed = make_embed("DATUM: WIKIPEDIA ERROR", truncate_text(text, 3900), SAR_ORANGE)
 			view = DepthSourcesView(None, query)
-			await interaction.followup.send(embed=embed, view=view)
+			await interaction.followup.send(embed=embed, view=view, ephemeral=private)
 			return
 		extract = payload.get("extract") or "No summary extract was returned."
 		article_url = payload.get("content_urls", {}).get("desktop", {}).get("page") or wikipedia_desktop_url(query)
 		title = payload.get("title") or query
 		embed = make_embed(f"DATUM: {title}", truncate_text(extract, 3900), OREGON_GREEN)
 		view = DepthSourcesView(article_url, query)
-		await interaction.followup.send(embed=embed, view=view)
+		await interaction.followup.send(embed=embed, view=view, ephemeral=private)
 		return
 
 	if selected == "ai":
+		prompt = compose_ai_prompt(interaction.user.id, query, "datum ai lookup")
 		count = ai_count_for_user(interaction.user.id)
 		if count >= AI_LIMIT:
 			await interaction.followup.send(
@@ -656,11 +1450,12 @@ async def datum_cmd(interaction: discord.Interaction, query: str, source: app_co
 					"SAR QUOTA REACHED",
 					"Daily AI capacity is exhausted for this UTC day. Try again after 00:00 UTC.",
 					SAR_ORANGE,
-				)
+				),
+				ephemeral=private,
 			)
 			return
 		if count >= 20:
-			view = ProceedsView(interaction.user.id, query, "ai", "DATUM: AI ANALYSIS")
+			view = ProceedsView(interaction.user.id, prompt, "ai", "DATUM: AI ANALYSIS")
 			await interaction.followup.send(
 				embed=make_embed(
 					"AI EXECUTION HOLD",
@@ -668,19 +1463,20 @@ async def datum_cmd(interaction: discord.Interaction, query: str, source: app_co
 					SAR_ORANGE,
 				),
 				view=view,
+				ephemeral=private,
 			)
 			return
-		success, output = await gemini_generate(query)
+		success, output = await gemini_generate(prompt)
 		if not success:
 			embed = make_embed("GEMINI API ERROR", truncate_text(output, 3900), SAR_ORANGE)
 			view = DepthSourcesView(None, query)
-			await interaction.followup.send(embed=embed, view=view)
+			await interaction.followup.send(embed=embed, view=view, ephemeral=private)
 			return
 		count_after = await increment_ai_count(interaction.user.id)
 		embed = make_embed("DATUM: AI ANALYSIS", truncate_text(output, 3900), ai_footer_color(count_after))
 		embed.set_footer(text=ai_footer(count_after))
 		view = DepthSourcesView(None, query)
-		await interaction.followup.send(embed=embed, view=view)
+		await interaction.followup.send(embed=embed, view=view, ephemeral=private)
 		return
 
 
@@ -728,7 +1524,8 @@ async def handle_ai_prompt(interaction: discord.Interaction, prompt: str, title:
 				"SAR QUOTA REACHED",
 				"Daily AI capacity is exhausted for this UTC day. Try again after 00:00 UTC.",
 				SAR_ORANGE,
-			)
+			),
+			ephemeral=current_visibility(interaction.user.id),
 		)
 		return
 	if count >= 20:
@@ -739,18 +1536,19 @@ async def handle_ai_prompt(interaction: discord.Interaction, prompt: str, title:
 				SAR_ORANGE,
 			),
 			view=ProceedsView(interaction.user.id, prompt, "ai", title),
+			ephemeral=current_visibility(interaction.user.id),
 		)
 		return
 
-	await interaction.response.defer()
+	await interaction.response.defer(ephemeral=current_visibility(interaction.user.id))
 	success, output = await gemini_generate(prompt)
 	if not success:
-		await interaction.followup.send(embed=make_embed("GEMINI API ERROR", truncate_text(output, 3900), SAR_ORANGE))
+		await interaction.followup.send(embed=make_embed("GEMINI API ERROR", truncate_text(output, 3900), SAR_ORANGE), ephemeral=current_visibility(interaction.user.id))
 		return
 	count_after = await increment_ai_count(interaction.user.id)
 	embed = make_embed(title, truncate_text(output, 3900), ai_footer_color(count_after))
 	embed.set_footer(text=ai_footer(count_after))
-	await interaction.followup.send(embed=embed)
+	await interaction.followup.send(embed=embed, ephemeral=current_visibility(interaction.user.id))
 
 
 @bot.tree.command(name="ai", description="General machine intelligence terminal query path.")
@@ -758,7 +1556,7 @@ async def handle_ai_prompt(interaction: discord.Interaction, prompt: str, title:
 @app_commands.guild_install()
 @app_commands.user_install()
 async def ai_cmd(interaction: discord.Interaction, query: str) -> None:
-	prompt = clean_text(query)
+	prompt = compose_ai_prompt(interaction.user.id, clean_text(query), "general ai response")
 	await handle_ai_prompt(interaction, prompt, "SQUELCH AI RESPONSE")
 
 
@@ -997,6 +1795,14 @@ async def commslog_cmd(interaction: discord.Interaction, entry: str) -> None:
 			OREGON_GREEN,
 		)
 	)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+	if message.author.bot:
+		return
+	await log_blackbox_message(message)
+	await bot.process_commands(message)
 
 
 @bot.event

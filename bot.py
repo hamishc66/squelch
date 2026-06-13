@@ -828,10 +828,9 @@ async def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Di
 async def gemini_generate(prompt: str) -> Tuple[bool, str]:
 	if not GEMINI_API_KEY:
 		return False, "Gemini API key missing. Set GEMINI_API_KEY in the environment."
-	url = (
-		"https://generativelanguage.googleapis.com/v1beta/models/"
-		"gemini-1.5-flash:generateContent?key=" + urllib.parse.quote_plus(GEMINI_API_KEY)
-	)
+
+	url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={urllib.parse.quote_plus(GEMINI_API_KEY)}"
+
 	payload = {
 		"contents": [{"role": "user", "parts": [{"text": prompt}]}],
 		"generationConfig": {
@@ -854,7 +853,6 @@ async def gemini_generate(prompt: str) -> Tuple[bool, str]:
 		return True, text.strip()
 	except Exception:
 		return True, text.strip()
-
 
 def parse_query_location(value: str) -> Optional[Tuple[float, float]]:
 	cleaned = clean_text(value)

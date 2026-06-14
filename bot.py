@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+import asyncpg
 import discord
 from aiohttp import web
 from discord import app_commands
@@ -19,29 +20,13 @@ from pypdf import PdfReader
 
 # ═══════════════════════════════════════════════════════════════
 #  PATHS & ENVIRONMENT
-#  Set DATA_DIR env var on Koyeb to point at your mounted volume.
-#  e.g. DATA_DIR=/data  — all persistent files live there.
 # ═══════════════════════════════════════════════════════════════
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-WHITELIST_PATH  = DATA_DIR / "whitelist.txt"
-AI_TRACKER_PATH = DATA_DIR / "ai_tracker.json"
-COMMS_HISTORY_PATH = DATA_DIR / "comms_history.txt"
-MODE_STATE_PATH = DATA_DIR / "mode_state.json"
-THEME_STATE_PATH = DATA_DIR / "theme_state.json"
-REMINDERS_PATH  = DATA_DIR / "reminders.json"
-DEADROPS_PATH   = DATA_DIR / "deadrops.json"
-BLACKBOX_LOG_PATH = DATA_DIR / "blackbox.log"
-ERROR_LOG_PATH  = DATA_DIR / "errors.log"
 
 PORT            = int(os.getenv("PORT", "8080"))
 TOKEN           = os.getenv("DISCORD_TOKEN", "")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
-# OWNER_ID: fallback whitelist for solo use — set as env var on Koyeb
 OWNER_ID        = int(os.getenv("OWNER_ID", "0"))
+DATABASE_URL    = os.getenv("DATABASE_URL", "")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -154,22 +139,6 @@ RED_FLAG_KEYWORDS = {
 	"seizure", "seizing", "major bleed", "massive bleeding",
 	"anaphylaxis", "shock", "burn", "airway", "cyanosis",
 }
-
-
-# ═══════════════════════════════════════════════════════════════
-#  IN-MEMORY CACHES & LOCKS
-# ═══════════════════════════════════════════════════════════════
-
-_MODE_STATE_CACHE:     Dict[str, Any] = {}
-_THEME_STATE_CACHE:    Dict[str, Any] = {}
-_REMINDERS_STATE_CACHE: Dict[str, Any] = {}
-_DEADROPS_STATE_CACHE: Dict[str, Any] = {}
-_BLACKBOX_CHANNELS:    set = set()
-
-PERSISTENCE_LOCK  = asyncio.Lock()
-AI_TRACKER_LOCK   = asyncio.Lock()
-_ACTIONS_LOCK     = asyncio.Lock()
-ERROR_LOG_LOCK    = asyncio.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -442,107 +411,53 @@ def classify_triage(query: str) -> Tuple[str, str]:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PERSISTENCE — JSON FILE I/O
+#  DATABASE PERSISTENCE (SUPABASE ASYNC ROUTINES)
 # ═══════════════════════════════════════════════════════════════
 
-def load_json_file(path: Path) -> Dict[str, Any]:
-	if not path.exists():
-		return {}
-	try:
-		with path.open("r", encoding="utf-8") as fh:
-			data = json.load(fh)
-			return data if isinstance(data, dict) else {}
-	except Exception:
-		return {}
-
-
-def save_json_file(path: Path, payload: Dict[str, Any]) -> None:
-	tmp = path.with_suffix(path.suffix + ".tmp")
-	with tmp.open("w", encoding="utf-8") as fh:
-		json.dump(payload, fh, indent=2, sort_keys=True)
-		fh.write("\n")
-	os.replace(str(tmp), str(path))
-
-
-def save_state(path: Path, payload: Any) -> None:
-	save_json_file(path, payload)
-
-
-_MODE_STATE_CACHE   = load_json_file(MODE_STATE_PATH)
-_THEME_STATE_CACHE  = load_json_file(THEME_STATE_PATH)
-_REMINDERS_STATE_CACHE = load_json_file(REMINDERS_PATH)
-_DEADROPS_STATE_CACHE  = load_json_file(DEADROPS_PATH)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  WHITELIST — supports file OR OWNER_ID env var
-# ═══════════════════════════════════════════════════════════════
-
-def load_whitelist() -> List[int]:
+async def load_whitelist() -> List[int]:
 	ids: List[int] = []
 	if OWNER_ID:
 		ids.append(OWNER_ID)
-	if not WHITELIST_PATH.exists():
+	if not bot.db_pool:
 		return ids
-	with WHITELIST_PATH.open("r", encoding="utf-8") as fh:
-		for raw in fh:
-			line = clean_text(raw)
-			if not line or line.startswith("#"):
-				continue
-			try:
-				uid = int(line)
+	try:
+		async with bot.db_pool.acquire() as conn:
+			rows = await conn.fetch("SELECT user_id FROM whitelist")
+			for r in rows:
+				uid = r["user_id"]
 				if uid not in ids:
 					ids.append(uid)
-			except ValueError:
-				continue
+	except Exception:
+		pass
 	return ids
 
 
-# ═══════════════════════════════════════════════════════════════
-#  AI USAGE TRACKING
-# ═══════════════════════════════════════════════════════════════
-
-def normalize_ai_store(store: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+async def ai_count_for_user(user_id: int) -> int:
 	today = utc_date_key()
-	out: Dict[str, Dict[str, Any]] = {}
-	for uid, entry in store.items():
-		if not isinstance(entry, dict):
-			continue
-		try:
-			count = int(entry.get("count", 0))
-		except (TypeError, ValueError):
-			count = 0
-		if str(entry.get("date", today)) != today:
-			count = 0
-		out[str(uid)] = {"date": today, "count": max(0, count)}
-	return out
-
-
-_AI_TRACKER_CACHE = normalize_ai_store(load_json_file(AI_TRACKER_PATH))
-
-
-def ai_count_for_user(user_id: int) -> int:
-	entry = _AI_TRACKER_CACHE.get(str(user_id))
-	if not entry or entry.get("date") != utc_date_key():
+	if not bot.db_pool:
 		return 0
-	try:
-		return int(entry.get("count", 0))
-	except (TypeError, ValueError):
+	async with bot.db_pool.acquire() as conn:
+		row = await conn.fetchrow("SELECT date, count FROM ai_tracker WHERE user_id = $1", user_id)
+	if not row or row["date"] != today:
 		return 0
+	return int(row["count"])
 
 
 async def increment_ai_count(user_id: int) -> int:
-	async with AI_TRACKER_LOCK:
-		global _AI_TRACKER_CACHE
-		_AI_TRACKER_CACHE = normalize_ai_store(_AI_TRACKER_CACHE)
-		key = str(user_id)
-		entry = _AI_TRACKER_CACHE.setdefault(key, {"date": utc_date_key(), "count": 0})
-		if entry.get("date") != utc_date_key():
-			entry["date"] = utc_date_key()
-			entry["count"] = 0
-		entry["count"] = int(entry.get("count", 0)) + 1
-		save_json_file(AI_TRACKER_PATH, _AI_TRACKER_CACHE)
-		return int(entry["count"])
+	today = utc_date_key()
+	if not bot.db_pool:
+		return 0
+	async with bot.db_pool.acquire() as conn:
+		row = await conn.fetchrow("SELECT date, count FROM ai_tracker WHERE user_id = $1", user_id)
+		if not row:
+			await conn.execute("INSERT INTO ai_tracker (user_id, date, count) VALUES ($1, $2, 1)", user_id, today)
+			return 1
+		if row["date"] != today:
+			await conn.execute("UPDATE ai_tracker SET date = $2, count = 1 WHERE user_id = $1", user_id, today)
+			return 1
+		new_count = int(row["count"]) + 1
+		await conn.execute("UPDATE ai_tracker SET count = $2 WHERE user_id = $1", user_id, new_count)
+		return new_count
 
 
 def ai_footer(count: int) -> str:
@@ -555,59 +470,78 @@ def ai_footer_color(count: int) -> discord.Color:
 	return OREGON_GREEN if count <= 20 else SAR_ORANGE
 
 
-# ═══════════════════════════════════════════════════════════════
-#  USER STATE — MODE & THEME
-# ═══════════════════════════════════════════════════════════════
-
-def _normalize_str_state(store: Dict[str, Any], default: str) -> Dict[str, str]:
-	return {str(k): v if isinstance(v, str) else default for k, v in store.items()}
-
-
-def get_user_mode(user_id: int) -> str:
-	return _normalize_str_state(_MODE_STATE_CACHE, "regular").get(str(user_id), "regular")
+async def get_user_mode(user_id: int) -> str:
+	if not bot.db_pool:
+		return "regular"
+	async with bot.db_pool.acquire() as conn:
+		val = await conn.fetchval("SELECT mode FROM mode_state WHERE user_id = $1", user_id)
+	return val or "regular"
 
 
-def get_user_theme(user_id: int) -> Dict[str, Any]:
-	tid = _normalize_str_state(_THEME_STATE_CACHE, DEFAULT_THEME_ID).get(str(user_id), DEFAULT_THEME_ID)
+async def get_user_theme(user_id: int) -> Dict[str, Any]:
+	if not bot.db_pool:
+		return THEME_BY_ID[DEFAULT_THEME_ID]
+	async with bot.db_pool.acquire() as conn:
+		tid = await conn.fetchval("SELECT theme_id FROM theme_state WHERE user_id = $1", user_id)
+	tid = tid or DEFAULT_THEME_ID
 	return THEME_BY_ID.get(tid, THEME_BY_ID[DEFAULT_THEME_ID])
 
 
 async def set_user_mode(user_id: int, mode: str) -> None:
-	_MODE_STATE_CACHE[str(user_id)] = mode
-	async with PERSISTENCE_LOCK:
-		save_state(MODE_STATE_PATH, _MODE_STATE_CACHE)
+	if not bot.db_pool:
+		return
+	async with bot.db_pool.acquire() as conn:
+		row = await conn.fetchrow("SELECT user_id FROM mode_state WHERE user_id = $1", user_id)
+		if row:
+			await conn.execute("UPDATE mode_state SET mode = $2 WHERE user_id = $1", user_id, mode)
+		else:
+			await conn.execute("INSERT INTO mode_state (user_id, mode) VALUES ($1, $2)", user_id, mode)
 
 
 async def set_user_theme(user_id: int, theme_id: str) -> None:
-	_THEME_STATE_CACHE[str(user_id)] = theme_id
-	async with PERSISTENCE_LOCK:
-		save_state(THEME_STATE_PATH, _THEME_STATE_CACHE)
+	if not bot.db_pool:
+		return
+	async with bot.db_pool.acquire() as conn:
+		row = await conn.fetchrow("SELECT user_id FROM theme_state WHERE user_id = $1", user_id)
+		if row:
+			await conn.execute("UPDATE theme_state SET theme_id = $2 WHERE user_id = $1", user_id, theme_id)
+		else:
+			await conn.execute("INSERT INTO theme_state (user_id, theme_id) VALUES ($1, $2)", user_id, theme_id)
 
 
-def current_visibility(user_id: int) -> bool:
-	return get_user_mode(user_id) in {"stealth", "blackbox"}
+async def current_visibility(user_id: int) -> bool:
+	mode = await get_user_mode(user_id)
+	return mode in {"stealth", "blackbox"}
 
 
 # ═══════════════════════════════════════════════════════════════
-#  LOGGING — BLACKBOX & ERROR
+#  LOGGING — CENTRALIZED DATABASE OPERATIONS
 # ═══════════════════════════════════════════════════════════════
 
 async def write_blackbox_log(line: str) -> None:
 	print(line)
-	async with PERSISTENCE_LOCK:
-		with BLACKBOX_LOG_PATH.open("a", encoding="utf-8") as fh:
-			fh.write(line + "\n")
+	if not bot.db_pool:
+		return
+	try:
+		async with bot.db_pool.acquire() as conn:
+			await conn.execute("INSERT INTO system_logs (ts, log_type, detail) VALUES ($1, 'blackbox', $2)", utc_now().isoformat(), line)
+	except Exception:
+		pass
 
 
 async def write_error_log(line: str) -> None:
 	print(f"[ERROR] {line}")
-	async with ERROR_LOG_LOCK:
-		with ERROR_LOG_PATH.open("a", encoding="utf-8") as fh:
-			fh.write(line + "\n")
+	if not bot.db_pool:
+		return
+	try:
+		async with bot.db_pool.acquire() as conn:
+			await conn.execute("INSERT INTO system_logs (ts, log_type, detail) VALUES ($1, 'error', $2)", utc_now().isoformat(), line)
+	except Exception:
+		pass
 
 
 async def log_blackbox_event(interaction: discord.Interaction, event: str, details: str) -> None:
-	if get_user_mode(interaction.user.id) != "blackbox":
+	if await get_user_mode(interaction.user.id) != "blackbox":
 		return
 	channel_label = f"channel={getattr(interaction.channel, 'id', 'dm')}"
 	guild_label   = f"guild={interaction.guild_id or 'dm'}"
@@ -615,39 +549,43 @@ async def log_blackbox_event(interaction: discord.Interaction, event: str, detai
 	await write_blackbox_log(
 		f"[{utc_now().isoformat()}] {event} {user_label} {guild_label} {channel_label} :: {truncate_text(details, 800)}"
 	)
-	if interaction.channel_id is not None:
-		_BLACKBOX_CHANNELS.add(interaction.channel_id)
 
 
 async def log_blackbox_message(message: discord.Message) -> None:
-	if message.channel.id not in _BLACKBOX_CHANNELS or message.author.bot:
+	if message.author.bot:
+		return
+	mode = await get_user_mode(message.author.id)
+	if mode != "blackbox":
 		return
 	await write_blackbox_log(
 		f"[{utc_now().isoformat()}] message user={message.author.id} channel={message.channel.id} :: {truncate_text(message.content or '', 800)}"
 	)
 
 
-def build_error_log_embed() -> discord.Embed:
-	if not ERROR_LOG_PATH.exists():
+async def build_error_log_embed() -> discord.Embed:
+	if not bot.db_pool:
+		return make_embed("✅ ERROR LOG", "Database pool non-functional.", OREGON_GREEN, timestamp=True)
+	try:
+		async with bot.db_pool.acquire() as conn:
+			rows = await conn.fetch("SELECT ts, detail FROM system_logs WHERE log_type = 'error' ORDER BY id DESC LIMIT 20")
+	except Exception:
+		rows = []
+	if not rows:
 		return make_embed("✅ ERROR LOG", "No errors logged. All systems nominal.", OREGON_GREEN, timestamp=True)
-	content = ERROR_LOG_PATH.read_text(encoding="utf-8", errors="ignore")
-	lines = [l for l in content.splitlines() if l.strip()]
-	if not lines:
-		return make_embed("✅ ERROR LOG", "No errors logged. All systems nominal.", OREGON_GREEN, timestamp=True)
-	last = lines[-20:]
+	
+	lines = [f"[{r['ts']}] {r['detail']}" for r in reversed(rows)]
 	embed = discord.Embed(
 		title="⚡ ERROR LOG",
-		description=f"```\n{truncate_text(chr(10).join(last), 3800)}\n```",
+		description=f"```\n{truncate_text(chr(10).join(lines), 3800)}\n```",
 		color=ERROR_RED,
 		timestamp=utc_now(),
 	)
-	embed.set_footer(text=f"Showing {len(last)} of {len(lines)} entries  •  DATA_DIR: {DATA_DIR}")
+	embed.set_footer(text=f"Showing last {len(rows)} entries")
 	return embed
 
 
 # ═══════════════════════════════════════════════════════════════
 #  CORE SEND HELPER
-#  *** THE FIX: never pass file/view/content when None ***
 # ═══════════════════════════════════════════════════════════════
 
 async def mode_send(
@@ -659,12 +597,11 @@ async def mode_send(
 	file: Optional[discord.File] = None,
 	ephemeral: Optional[bool] = None,
 ) -> None:
-	is_ephemeral = current_visibility(interaction.user.id) if ephemeral is None else ephemeral
-	if get_user_mode(interaction.user.id) == "blackbox":
+	is_ephemeral = await current_visibility(interaction.user.id) if ephemeral is None else ephemeral
+	if await get_user_mode(interaction.user.id) == "blackbox":
 		await write_blackbox_log(
 			f"[{utc_now().isoformat()}] response user={interaction.user.id} :: {payload_preview(content, embed)}"
 		)
-	# Build kwargs — only include non-None values to avoid discord.py NoneType crashes
 	kwargs: Dict[str, Any] = {"ephemeral": is_ephemeral}
 	if content is not None:
 		kwargs["content"] = content
@@ -679,48 +616,6 @@ async def mode_send(
 		await interaction.followup.send(**kwargs)
 	else:
 		await interaction.response.send_message(**kwargs)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  REMINDER STATE HELPERS
-# ═══════════════════════════════════════════════════════════════
-
-def normalize_reminders_state(store: Any) -> Dict[str, Any]:
-	if not isinstance(store, dict):
-		return {"items": [], "next_id": 1}
-	items = store.get("items")
-	if not isinstance(items, list):
-		items = []
-	try:
-		nid = max(1, int(store.get("next_id", 1)))
-	except (TypeError, ValueError):
-		nid = 1
-	return {"items": items, "next_id": nid}
-
-
-def normalize_deadrops_state(store: Any) -> Dict[str, Any]:
-	if not isinstance(store, dict):
-		return {"items": [], "next_id": 1}
-	items = store.get("items")
-	if not isinstance(items, list):
-		items = []
-	try:
-		nid = max(1, int(store.get("next_id", 1)))
-	except (TypeError, ValueError):
-		nid = 1
-	return {"items": items, "next_id": nid}
-
-
-def reminder_state() -> Dict[str, Any]:
-	global _REMINDERS_STATE_CACHE
-	_REMINDERS_STATE_CACHE = normalize_reminders_state(_REMINDERS_STATE_CACHE)
-	return _REMINDERS_STATE_CACHE
-
-
-def deadrop_state() -> Dict[str, Any]:
-	global _DEADROPS_STATE_CACHE
-	_DEADROPS_STATE_CACHE = normalize_deadrops_state(_DEADROPS_STATE_CACHE)
-	return _DEADROPS_STATE_CACHE
 
 
 def reminder_label(record: Dict[str, Any]) -> str:
@@ -744,7 +639,7 @@ async def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Di
 	timeout = aiohttp.ClientTimeout(total=30)
 	req_headers = {"Content-Type": "application/json"}
 	if headers:
-		req_headers.update(headers)
+		req_headers.update(req_headers)
 	async with aiohttp.ClientSession(timeout=timeout) as session:
 		async with session.post(url, json=payload, headers=req_headers) as resp:
 			text = await resp.text()
@@ -767,7 +662,6 @@ async def http_get_json(url: str, headers: Optional[Dict[str, str]] = None) -> T
 			return resp.status, payload, text
 
 
-# Alias used by weather/gps commands
 async def fetch_json_with_headers(url: str, headers: Dict[str, str]) -> Tuple[int, Any, str]:
 	return await http_get_json(url, headers)
 
@@ -776,7 +670,7 @@ async def gemini_generate(prompt: str) -> Tuple[bool, str]:
 	if not GEMINI_API_KEY:
 		return False, "Gemini API key missing. Set GEMINI_API_KEY in Koyeb environment variables."
 	url = (
-		"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+		"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 		f"?key={urllib.parse.quote_plus(GEMINI_API_KEY)}"
 	)
 	payload = {
@@ -797,8 +691,8 @@ async def gemini_generate(prompt: str) -> Tuple[bool, str]:
 		return True, text.strip()
 
 
-def compose_ai_prompt(user_id: int, prompt: str, purpose: str) -> str:
-	theme = get_user_theme(user_id)
+async def compose_ai_prompt(user_id: int, prompt: str, purpose: str) -> str:
+	theme = await get_user_theme(user_id)
 	return (
 		f"SYSTEM THEME: {theme['label']}\n"
 		f"AI PERSONA: {theme['persona']}\n"
@@ -808,13 +702,9 @@ def compose_ai_prompt(user_id: int, prompt: str, purpose: str) -> str:
 	)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SHARED AI COMMAND HANDLER — used by /ai, /datum ai, /gaslight
-# ═══════════════════════════════════════════════════════════════
-
 async def handle_ai_prompt(interaction: discord.Interaction, prompt: str, title: str, already_deferred: bool = False) -> None:
-	count = ai_count_for_user(interaction.user.id)
-	ephemeral = current_visibility(interaction.user.id)
+	count = await ai_count_for_user(interaction.user.id)
+	ephemeral = await current_visibility(interaction.user.id)
 
 	if count >= AI_LIMIT:
 		embed = make_embed("🛑 SAR QUOTA REACHED", "Daily AI capacity exhausted for this UTC day. Try again after `00:00Z`.", SAR_ORANGE, timestamp=True)
@@ -877,8 +767,32 @@ class SquelchBot(commands.Bot):
 		intents.message_content = True
 		super().__init__(command_prefix="/", intents=intents)
 		self.http_runner: Optional[web.AppRunner] = None
+		self.db_pool: Optional[asyncpg.Pool] = None
 
 	async def setup_hook(self) -> None:
+		if not DATABASE_URL:
+			raise RuntimeError("DATABASE_URL environment variable is missing.")
+		
+		self.db_pool = await asyncpg.create_pool(DATABASE_URL)
+		async with self.db_pool.acquire() as conn:
+			await conn.execute("""
+				CREATE TABLE IF NOT EXISTS whitelist (user_id BIGINT PRIMARY KEY);
+				CREATE TABLE IF NOT EXISTS ai_tracker (user_id BIGINT PRIMARY KEY, date TEXT, count INT);
+				CREATE TABLE IF NOT EXISTS comms_log (id SERIAL PRIMARY KEY, ts TEXT, entry TEXT);
+				CREATE TABLE IF NOT EXISTS mode_state (user_id BIGINT PRIMARY KEY, mode TEXT);
+				CREATE TABLE IF NOT EXISTS theme_state (user_id BIGINT PRIMARY KEY, theme_id TEXT);
+				CREATE TABLE IF NOT EXISTS reminders (
+					id SERIAL PRIMARY KEY, user_id BIGINT, note TEXT, due_at TEXT, channel_id BIGINT,
+					created_at TEXT, sent BOOLEAN DEFAULT FALSE, sent_at TEXT, done BOOLEAN DEFAULT FALSE, 
+					done_at TEXT, deleted BOOLEAN DEFAULT FALSE, deleted_at TEXT
+				);
+				CREATE TABLE IF NOT EXISTS deadrops (
+					id SERIAL PRIMARY KEY, user_id BIGINT, key TEXT, content TEXT, secret TEXT,
+					created_at TEXT, deleted BOOLEAN DEFAULT FALSE, deleted_at TEXT
+				);
+				CREATE TABLE IF NOT EXISTS system_logs (id SERIAL PRIMARY KEY, ts TEXT, log_type TEXT, detail TEXT);
+			""")
+
 		await self._start_web_server()
 		if not reminder_dispatch.is_running():
 			reminder_dispatch.start()
@@ -887,6 +801,8 @@ class SquelchBot(commands.Bot):
 	async def close(self) -> None:
 		if self.http_runner:
 			await self.http_runner.cleanup()
+		if self.db_pool:
+			await self.db_pool.close()
 		await super().close()
 
 	async def _start_web_server(self) -> None:
@@ -909,12 +825,12 @@ bot = SquelchBot()
 # ═══════════════════════════════════════════════════════════════
 
 async def whitelist_gatekeeper(interaction: discord.Interaction) -> bool:
-	allowed = set(load_whitelist())
+	allowed = set(await load_whitelist())
 	if interaction.user is None or interaction.user.id not in allowed:
 		embed = make_embed(
 			"🔒 ACCESS DENIED",
 			"This Squelch deployment is restricted to the local whitelist.\n"
-			"Set `OWNER_ID` as an environment variable on Koyeb, or add your Discord user ID to `whitelist.txt`.",
+			"Set `OWNER_ID` as an environment variable on Koyeb, or add your Discord user ID to the database index.",
 			ERROR_RED,
 		)
 		kwargs: Dict[str, Any] = {"embed": embed, "ephemeral": True}
@@ -949,7 +865,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 		color=ERROR_RED,
 		timestamp=utc_now(),
 	)
-	embed.add_field(name="Command",    value=f"`/{cmd_name}`",              inline=True)
+	embed.add_field(name="Command",    value=f"`/{cmd_name}`",            inline=True)
 	embed.add_field(name="Error Type", value=f"`{type(error).__name__}`",  inline=True)
 	embed.add_field(name="Detail",     value=f"```{truncate_text(str(error), 900)}```", inline=False)
 	embed.set_footer(text="Use /errorlog to view full history • Report logged automatically")
@@ -970,45 +886,37 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @tasks.loop(seconds=30)
 async def reminder_dispatch() -> None:
-	state   = reminder_state()
-	items   = state.get("items", [])
-	now     = utc_now()
-	changed = False
-	for record in items:
-		if not isinstance(record, dict) or record.get("sent"):
-			continue
-		try:
-			due = datetime.fromisoformat(record.get("due_at","").replace("Z","+00:00"))
-		except Exception:
-			continue
-		if due > now:
-			continue
-		user    = bot.get_user(int(record.get("user_id", 0)))
-		chan_id = record.get("channel_id")
-		embed   = reminder_embed(record)
-		try:
-			sent = False
-			if user:
-				try:
-					await user.send(embed=embed)
-					sent = True
-				except Exception:
-					pass
-			if not sent and chan_id:
-				chan = bot.get_channel(int(chan_id))
-				if chan:
-					await chan.send(embed=embed)
-					sent = True
-			if not sent:
-				continue
-			record["sent"]    = True
-			record["sent_at"] = utc_now().isoformat()
-			changed = True
-		except Exception as exc:
-			await write_error_log(f"[{utc_now().isoformat()}] reminder-error id={record.get('id')} {exc}")
-	if changed:
-		async with PERSISTENCE_LOCK:
-			save_state(REMINDERS_PATH, state)
+	if not bot.db_pool:
+		return
+	now = utc_now().isoformat()
+	try:
+		async with bot.db_pool.acquire() as conn:
+			records = await conn.fetch("SELECT * FROM reminders WHERE sent = FALSE AND due_at <= $1 AND deleted = FALSE AND done = FALSE", now)
+			for r in records:
+				user = bot.get_user(int(r["user_id"]))
+				chan_id = r["channel_id"]
+				
+				r_dict = dict(r)
+				embed = reminder_embed(r_dict)
+				
+				sent = False
+				if user:
+					try:
+						await user.send(embed=embed)
+						sent = True
+					except Exception:
+						pass
+				if not sent and chan_id:
+					chan = bot.get_channel(int(chan_id))
+					if chan:
+						await chan.send(embed=embed)
+						sent = True
+				if not sent:
+					continue
+				
+				await conn.execute("UPDATE reminders SET sent = TRUE, sent_at = $1 WHERE id = $2", utc_now().isoformat(), r["id"])
+	except Exception as exc:
+		await write_error_log(f"reminder-loop error: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1126,17 +1034,21 @@ class ErrorLogView(discord.ui.View):
 		if interaction.user.id != self.owner_id:
 			await interaction.response.send_message("This belongs to someone else.", ephemeral=True)
 			return
-		await interaction.response.edit_message(embed=build_error_log_embed(), view=self)
+		embed = await build_error_log_embed()
+		await interaction.response.edit_message(embed=embed, view=self)
 
 	@discord.ui.button(label="🗑️ Clear Log", style=discord.ButtonStyle.danger)
 	async def clear(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
 		if interaction.user.id != self.owner_id:
 			await interaction.response.send_message("This belongs to someone else.", ephemeral=True)
 			return
-		if ERROR_LOG_PATH.exists():
-			ERROR_LOG_PATH.write_text("", encoding="utf-8")
+		try:
+			async with bot.db_pool.acquire() as conn:
+				await conn.execute("DELETE FROM system_logs WHERE log_type = 'error'")
+		except Exception:
+			pass
 		await interaction.response.edit_message(
-			embed=make_embed("🗑️ ERROR LOG CLEARED", "Log wiped. All clear.", OREGON_GREEN, timestamp=True),
+			embed=make_embed("🗑️ ERROR LOG CLEARED", "Log database rows wiped. All clear.", OREGON_GREEN, timestamp=True),
 			view=self,
 		)
 
@@ -1147,8 +1059,9 @@ class ErrorLogLinkView(discord.ui.View):
 
 	@discord.ui.button(label="📋 View Error Log", style=discord.ButtonStyle.secondary)
 	async def view_log(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+		embed = await build_error_log_embed()
 		await interaction.response.send_message(
-			embed=build_error_log_embed(),
+			embed=embed,
 			view=ErrorLogView(interaction.user.id),
 			ephemeral=True,
 		)
@@ -1197,17 +1110,18 @@ class QuotaView(discord.ui.View):
 		if interaction.user.id != self.owner_id:
 			await interaction.response.send_message("This belongs to someone else.", ephemeral=True)
 			return
-		await interaction.response.edit_message(embed=build_quota_embed(interaction.user.id), view=self)
+		embed = await build_quota_embed(interaction.user.id)
+		await interaction.response.edit_message(embed=embed, view=self)
 
 
-def build_quota_embed(user_id: int) -> discord.Embed:
-	count     = ai_count_for_user(user_id)
+async def build_quota_embed(user_id: int) -> discord.Embed:
+	count     = await ai_count_for_user(user_id)
 	remaining = max(0, AI_LIMIT - count)
-	pct       = int((count / AI_LIMIT) * 100)
+	pct        = int((count / AI_LIMIT) * 100)
 	bar_on    = round(count / AI_LIMIT * 20)
-	bar       = "█" * bar_on + "░" * (20 - bar_on)
-	color     = OREGON_GREEN if count < 20 else SAR_ORANGE if count < AI_LIMIT else ERROR_RED
-	status    = "✅ Clear" if count < 20 else "⚠️ Getting Low" if count < AI_LIMIT else "🛑 Exhausted"
+	bar        = "█" * bar_on + "░" * (20 - bar_on)
+	color      = OREGON_GREEN if count < 20 else SAR_ORANGE if count < AI_LIMIT else ERROR_RED
+	status      = "✅ Clear" if count < 20 else "⚠️ Getting Low" if count < AI_LIMIT else "🛑 Exhausted"
 	embed = discord.Embed(title="📊 AI QUOTA STATUS", color=color, timestamp=utc_now())
 	embed.add_field(name="Used Today",  value=f"`{count}/{AI_LIMIT}`",  inline=True)
 	embed.add_field(name="Remaining",   value=f"`{remaining}`",         inline=True)
@@ -1224,15 +1138,15 @@ def build_quota_embed(user_id: int) -> discord.Embed:
 @bot.tree.command(name="mode", description="Switch your Squelch operating mode.")
 @app_commands.describe(mode="Pick regular, stealth, or blackbox.")
 @app_commands.choices(mode=[
-	app_commands.Choice(name="🟢 Regular",   value="regular"),
-	app_commands.Choice(name="👻 Stealth",   value="stealth"),
+	app_commands.Choice(name="🟢 Regular",    value="regular"),
+	app_commands.Choice(name="👻 Stealth",    value="stealth"),
 	app_commands.Choice(name="⬛ Blackbox",  value="blackbox"),
 ])
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.guild_install()
 @app_commands.user_install()
 async def mode_command(interaction: discord.Interaction, mode: app_commands.Choice[str]) -> None:
-	previous = get_user_mode(interaction.user.id)
+	previous = await get_user_mode(interaction.user.id)
 	await set_user_mode(interaction.user.id, mode.value)
 	desc = (
 		f"Mode updated: **{previous}** → **{mode.value}**\n\n"
@@ -1246,8 +1160,6 @@ async def mode_command(interaction: discord.Interaction, mode: app_commands.Choi
 		ephemeral=mode.value != "regular",
 	)
 	if mode.value == "blackbox" or previous == "blackbox":
-		if interaction.channel_id and mode.value == "blackbox":
-			_BLACKBOX_CHANNELS.add(interaction.channel_id)
 		await write_blackbox_log(
 			f"[{utc_now().isoformat()}] mode user={interaction.user.id} {previous}→{mode.value}"
 		)
@@ -1258,7 +1170,7 @@ async def mode_command(interaction: discord.Interaction, mode: app_commands.Choi
 @app_commands.guild_install()
 @app_commands.user_install()
 async def theme_command(interaction: discord.Interaction) -> None:
-	theme = get_user_theme(interaction.user.id)
+	theme = await get_user_theme(interaction.user.id)
 	embed = make_embed(
 		f"🎨 THEME DESK: {theme['label']}",
 		f"Active skin: {theme_card(theme)}\n\n"
@@ -1274,9 +1186,10 @@ async def theme_command(interaction: discord.Interaction) -> None:
 @app_commands.guild_install()
 @app_commands.user_install()
 async def quota_command(interaction: discord.Interaction) -> None:
+	embed = await build_quota_embed(interaction.user.id)
 	await mode_send(
 		interaction,
-		embed=build_quota_embed(interaction.user.id),
+		embed=embed,
 		view=QuotaView(interaction.user.id),
 		ephemeral=True,
 	)
@@ -1287,9 +1200,10 @@ async def quota_command(interaction: discord.Interaction) -> None:
 @app_commands.guild_install()
 @app_commands.user_install()
 async def errorlog_command(interaction: discord.Interaction) -> None:
+	embed = await build_error_log_embed()
 	await mode_send(
 		interaction,
-		embed=build_error_log_embed(),
+		embed=embed,
 		view=ErrorLogView(interaction.user.id),
 		ephemeral=True,
 	)
@@ -1301,7 +1215,7 @@ async def errorlog_command(interaction: discord.Interaction) -> None:
 @app_commands.guild_install()
 @app_commands.user_install()
 async def ai_cmd(interaction: discord.Interaction, query: str) -> None:
-	prompt = compose_ai_prompt(interaction.user.id, clean_text(query), "general ai response")
+	prompt = await compose_ai_prompt(interaction.user.id, clean_text(query), "general ai response")
 	await handle_ai_prompt(interaction, prompt, "🤖 SQUELCH AI RESPONSE")
 
 
@@ -1311,8 +1225,8 @@ async def ai_cmd(interaction: discord.Interaction, query: str) -> None:
 @app_commands.guild_install()
 @app_commands.user_install()
 async def gaslight_cmd(interaction: discord.Interaction, user: discord.Member, topic: str) -> None:
-	theme = get_user_theme(interaction.user.id)
-	prompt = compose_ai_prompt(
+	theme = await get_user_theme(interaction.user.id)
+	prompt = await compose_ai_prompt(
 		interaction.user.id,
 		f"You are writing an official SQUELCH INCIDENT FIELD RECORD in deadpan bureaucratic tone using the {theme['label']} persona.\n"
 		f"The subject of this record is: {user.display_name} (callsign unknown).\n"
@@ -1339,8 +1253,8 @@ async def gaslight_cmd(interaction: discord.Interaction, user: discord.Member, t
 @app_commands.guild_install()
 @app_commands.user_install()
 async def study_command(interaction: discord.Interaction, topic: str, source: Optional[discord.Attachment] = None) -> None:
-	theme = get_user_theme(interaction.user.id)
-	await interaction.response.defer(ephemeral=current_visibility(interaction.user.id))
+	theme = await get_user_theme(interaction.user.id)
+	await interaction.response.defer(ephemeral=await current_visibility(interaction.user.id))
 	source_block = ""
 	if source is not None:
 		ok, extracted = await extract_attachment_text(source)
@@ -1351,7 +1265,7 @@ async def study_command(interaction: discord.Interaction, topic: str, source: Op
 			await interaction.followup.send(embed=make_embed("❌ STUDY ERROR", "The attached file yielded no readable text.", ERROR_RED), ephemeral=True)
 			return
 		source_block = build_study_source_text(source.filename, extracted)
-	prompt = compose_ai_prompt(
+	prompt = await compose_ai_prompt(
 		interaction.user.id,
 		f"{study_system_prompt(theme)}\n\nCreate a study pack for the topic below.\n\nTOPIC: {topic}\n\nSOURCE NOTES:\n{source_block or 'No attachment provided — use topic and general best practices.'}",
 		"study helper",
@@ -1409,7 +1323,7 @@ async def triage_command(interaction: discord.Interaction, query: str) -> None:
 async def datum_cmd(interaction: discord.Interaction, query: str, source: app_commands.Choice[str]) -> None:
 	selected = source.value
 	query    = clean_text(query)
-	private  = current_visibility(interaction.user.id)
+	private  = await current_visibility(interaction.user.id)
 	await interaction.response.defer(ephemeral=private)
 
 	if selected == "google":
@@ -1442,7 +1356,7 @@ async def datum_cmd(interaction: discord.Interaction, query: str, source: app_co
 				view=DepthSourcesView(None, query), ephemeral=private,
 			)
 			return
-		extract     = payload.get("extract") or "No summary returned."
+		extract       = payload.get("extract") or "No summary returned."
 		article_url = payload.get("content_urls", {}).get("desktop", {}).get("page") or wikipedia_desktop_url(query)
 		title       = payload.get("title") or query
 		await interaction.followup.send(
@@ -1452,7 +1366,7 @@ async def datum_cmd(interaction: discord.Interaction, query: str, source: app_co
 		return
 
 	if selected == "ai":
-		prompt = compose_ai_prompt(interaction.user.id, query, "datum ai lookup")
+		prompt = await compose_ai_prompt(interaction.user.id, query, "datum ai lookup")
 		await handle_ai_prompt(interaction, prompt, "🤖 DATUM: AI ANALYSIS", already_deferred=True)
 
 
@@ -1698,9 +1612,12 @@ async def declination_cmd(interaction: discord.Interaction, location: str) -> No
 async def commslog_cmd(interaction: discord.Interaction, entry: str) -> None:
 	ts    = utc_now().strftime("%Y-%m-%d %H:%M:%SZ")
 	clean = clean_text(entry)
-	async with _ACTIONS_LOCK:
-		with COMMS_HISTORY_PATH.open("a", encoding="utf-8") as fh:
-			fh.write(f"[{ts}] {clean}\n")
+	if bot.db_pool:
+		try:
+			async with bot.db_pool.acquire() as conn:
+				await conn.execute("INSERT INTO comms_log (ts, entry) VALUES ($1, $2)", ts, clean)
+		except Exception as exc:
+			await write_error_log(f"comms row insertion fault: {exc}")
 	await interaction.response.send_message(
 		embed=make_embed("📻 COMMS LOG UPDATED", f"Stored at `{ts}`\n\n`{clean}`", OREGON_GREEN, timestamp=True)
 	)
@@ -1718,58 +1635,55 @@ async def commslog_cmd(interaction: discord.Interaction, entry: str) -> None:
 @app_commands.guild_install()
 @app_commands.user_install()
 async def reminders_command(interaction: discord.Interaction, action: app_commands.Choice[str], minutes: Optional[int] = None, note: Optional[str] = None, reminder_id: Optional[int] = None) -> None:
-	state    = reminder_state()
-	items    = state["items"]
 	user_id  = interaction.user.id
 	act      = action.value
 
-	if act == "add":
-		if not minutes or minutes <= 0:
-			await mode_send(interaction, content="Provide a positive number of minutes.", ephemeral=True)
-			return
-		if not note:
-			await mode_send(interaction, content="Provide reminder text.", ephemeral=True)
-			return
-		record = {
-			"id": state["next_id"], "user_id": user_id,
-			"note": clean_text(note),
-			"due_at": (utc_now() + timedelta(minutes=minutes)).isoformat(),
-			"channel_id": interaction.channel_id,
-			"created_at": utc_now().isoformat(), "sent": False,
-		}
-		state["next_id"] += 1
-		items.append(record)
-		async with PERSISTENCE_LOCK:
-			save_state(REMINDERS_PATH, state)
-		await mode_send(interaction, embed=make_embed("🔔 REMINDER STAGED", f"**#{record['id']}** fires in {minutes} min\n\n{record['note']}", OREGON_GREEN, timestamp=True))
+	if not bot.db_pool:
+		await interaction.response.send_message("Database layer unavailable.", ephemeral=True)
 		return
 
-	user_items = [r for r in items if isinstance(r, dict) and int(r.get("user_id",0)) == user_id and not r.get("deleted")]
-
-	if act == "list":
-		if not user_items:
-			await mode_send(interaction, content="No active reminders.", ephemeral=True)
+	async with bot.db_pool.acquire() as conn:
+		if act == "add":
+			if not minutes or minutes <= 0:
+				await mode_send(interaction, content="Provide a positive number of minutes.", ephemeral=True)
+				return
+			if not note:
+				await mode_send(interaction, content="Provide reminder text.", ephemeral=True)
+				return
+			due_str = (utc_now() + timedelta(minutes=minutes)).isoformat()
+			created_str = utc_now().isoformat()
+			
+			row_id = await conn.fetchval(
+				"INSERT INTO reminders (user_id, note, due_at, channel_id, created_at, sent) VALUES ($1, $2, $3, $4, $5, FALSE) RETURNING id",
+				user_id, clean_text(note), due_str, interaction.channel_id, created_str
+			)
+			await mode_send(interaction, embed=make_embed("🔔 REMINDER STAGED", f"**#{row_id}** fires in {minutes} min\n\n{clean_text(note)}", OREGON_GREEN, timestamp=True))
 			return
-		lines = [reminder_label(r) for r in sorted(user_items, key=lambda x: x.get("id",0))]
-		await mode_send(interaction, embed=make_embed("🔔 REMINDERS", "\n".join(lines), OREGON_GREEN), ephemeral=True)
-		return
 
-	if reminder_id is None:
-		await mode_send(interaction, content="Provide a reminder ID.", ephemeral=True)
-		return
-	match = next((r for r in user_items if int(r.get("id",0)) == reminder_id), None)
-	if match is None:
-		await mode_send(interaction, content="Reminder not found.", ephemeral=True)
-		return
-	if act == "done":
-		match["done"] = True
-		match["done_at"] = utc_now().isoformat()
-	elif act == "delete":
-		match["deleted"] = True
-		match["deleted_at"] = utc_now().isoformat()
-	async with PERSISTENCE_LOCK:
-		save_state(REMINDERS_PATH, state)
-	await mode_send(interaction, embed=make_embed("✅ REMINDER UPDATED", f"Reminder **#{reminder_id}** marked `{act}`.", OREGON_GREEN))
+		if act == "list":
+			rows = await conn.fetch("SELECT * FROM reminders WHERE user_id = $1 AND deleted = FALSE AND done = FALSE", user_id)
+			if not rows:
+				await mode_send(interaction, content="No active reminders.", ephemeral=True)
+				return
+			lines = [reminder_label(dict(r)) for r in sorted(rows, key=lambda x: x["id"])]
+			await mode_send(interaction, embed=make_embed("🔔 REMINDERS", "\n".join(lines), OREGON_GREEN), ephemeral=True)
+			return
+
+		if reminder_id is None:
+			await mode_send(interaction, content="Provide a reminder ID.", ephemeral=True)
+			return
+			
+		match = await conn.fetchrow("SELECT id FROM reminders WHERE id = $1 AND user_id = $2 AND deleted = FALSE", reminder_id, user_id)
+		if match is None:
+			await mode_send(interaction, content="Reminder not found.", ephemeral=True)
+			return
+			
+		if act == "done":
+			await conn.execute("UPDATE reminders SET done = TRUE, done_at = $1 WHERE id = $2", utc_now().isoformat(), reminder_id)
+		elif act == "delete":
+			await conn.execute("UPDATE reminders SET deleted = TRUE, deleted_at = $1 WHERE id = $2", utc_now().isoformat(), reminder_id)
+			
+		await mode_send(interaction, embed=make_embed("✅ REMINDER UPDATED", f"Reminder **#{reminder_id}** marked `{act}`.", OREGON_GREEN))
 
 
 @bot.tree.command(name="deadrop", description="Store, retrieve, list, or remove a dead drop note.")
@@ -1784,67 +1698,57 @@ async def reminders_command(interaction: discord.Interaction, action: app_comman
 @app_commands.guild_install()
 @app_commands.user_install()
 async def deadrop_command(interaction: discord.Interaction, action: app_commands.Choice[str], key: Optional[str] = None, content: Optional[str] = None, secret: Optional[str] = None, deadrop_id: Optional[int] = None) -> None:
-	state   = deadrop_state()
-	items   = state["items"]
 	act     = action.value
 	user_id = interaction.user.id
 
-	if act == "create":
-		if not key or not content:
-			await mode_send(interaction, content="Provide both key and content.", ephemeral=True)
-			return
-		record = {
-			"id": state["next_id"], "user_id": user_id,
-			"key": clean_text(key), "content": content,
-			"secret": clean_text(secret or ""),
-			"created_at": utc_now().isoformat(), "deleted": False,
-		}
-		state["next_id"] += 1
-		items.append(record)
-		async with PERSISTENCE_LOCK:
-			save_state(DEADROPS_PATH, state)
-		await mode_send(interaction, embed=make_embed("🔐 DEADROP CREATED", f"Stored `{record['key']}` as **#{record['id']}**.", OREGON_GREEN), ephemeral=True)
+	if not bot.db_pool:
+		await interaction.response.send_message("Database layer unavailable.", ephemeral=True)
 		return
 
-	active = [r for r in items if isinstance(r, dict) and not r.get("deleted")]
-
-	if act == "list":
-		if not active:
-			await mode_send(interaction, content="No dead drops stored.", ephemeral=True)
+	async with bot.db_pool.acquire() as conn:
+		if act == "create":
+			if not key or not content:
+				await mode_send(interaction, content="Provide both key and content.", ephemeral=True)
+				return
+			row_id = await conn.fetchval(
+				"INSERT INTO deadrops (user_id, key, content, secret, created_at, deleted) VALUES ($1, $2, $3, $4, $5, FALSE) RETURNING id",
+				user_id, clean_text(key), content, clean_text(secret or ""), utc_now().isoformat()
+			)
+			await mode_send(interaction, embed=make_embed("🔐 DEADROP CREATED", f"Stored `{clean_text(key)}` as **#{row_id}**.", OREGON_GREEN), ephemeral=True)
 			return
-		lines = [f"**#{r.get('id','?')}** — `{r.get('key','')}`" for r in active]
-		await mode_send(interaction, embed=make_embed("📋 DEADROP INDEX", "\n".join(lines), OREGON_GREEN), ephemeral=True)
-		return
 
-	if act == "retrieve":
-		match = next((r for r in active if (key and clean_text(r.get("key","")).lower() == clean_text(key).lower()) or (deadrop_id and int(r.get("id",0)) == deadrop_id)), None)
+		if act == "list":
+			rows = await conn.fetch("SELECT id, key FROM deadrops WHERE deleted = FALSE")
+			if not rows:
+				await mode_send(interaction, content="No dead drops stored.", ephemeral=True)
+				return
+			lines = [f"**#{r['id']}** — `{r['key']}`" for r in rows]
+			await mode_send(interaction, embed=make_embed("📋 DEADROP INDEX", "\n".join(lines), OREGON_GREEN), ephemeral=True)
+			return
+
+		if deadrop_id:
+			match = await conn.fetchrow("SELECT * FROM deadrops WHERE id = $1 AND deleted = FALSE", deadrop_id)
+		elif key:
+			match = await conn.fetchrow("SELECT * FROM deadrops WHERE LOWER(key) = LOWER($1) AND deleted = FALSE", clean_text(key))
+		else:
+			match = None
+
 		if match is None:
 			await mode_send(interaction, content="Dead drop not found.", ephemeral=True)
 			return
-		stored = clean_text(match.get("secret",""))
-		if stored and stored != clean_text(secret or ""):
-			await mode_send(interaction, content="Secret mismatch.", ephemeral=True)
-			return
-		await mode_send(interaction, embed=make_embed(f"🔓 DEADROP #{match.get('id','?')}", match.get("content",""), OREGON_GREEN), ephemeral=True)
-		return
 
-	if act == "delete":
-		if deadrop_id is None:
-			await mode_send(interaction, content="Provide a deadrop ID to delete.", ephemeral=True)
-			return
-		match = next((r for r in active if int(r.get("id",0)) == deadrop_id), None)
-		if match is None:
-			await mode_send(interaction, content="Dead drop not found.", ephemeral=True)
-			return
-		stored = clean_text(match.get("secret",""))
-		if stored and stored != clean_text(secret or ""):
+		stored_secret = clean_text(match["secret"] or "")
+		if stored_secret and stored_secret != clean_text(secret or ""):
 			await mode_send(interaction, content="Secret mismatch.", ephemeral=True)
 			return
-		match["deleted"]    = True
-		match["deleted_at"] = utc_now().isoformat()
-		async with PERSISTENCE_LOCK:
-			save_state(DEADROPS_PATH, state)
-		await mode_send(interaction, embed=make_embed("🗑️ DEADROP DELETED", f"Dead drop **#{deadrop_id}** removed.", SAR_ORANGE), ephemeral=True)
+
+		if act == "retrieve":
+			await mode_send(interaction, embed=make_embed(f"🔓 DEADROP #{match['id']}", match["content"], OREGON_GREEN), ephemeral=True)
+			return
+
+		if act == "delete":
+			await conn.execute("UPDATE deadrops SET deleted = TRUE, deleted_at = $1 WHERE id = $2", utc_now().isoformat(), match["id"])
+			await mode_send(interaction, embed=make_embed("🗑️ DEADROP DELETED", f"Dead drop **#{match['id']}** removed.", SAR_ORANGE), ephemeral=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1862,8 +1766,6 @@ async def on_message(message: discord.Message) -> None:
 @bot.event
 async def on_ready() -> None:
 	print(f"Squelch online as {bot.user} on port {PORT}")
-	print(f"DATA_DIR: {DATA_DIR}")
-	print(f"Whitelist IDs: {load_whitelist()}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1878,3 +1780,5 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
+	
+    	

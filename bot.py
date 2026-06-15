@@ -1,3 +1,4 @@
+# Original Code:
 import asyncio
 import json
 import math
@@ -28,6 +29,9 @@ GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
 OWNER_ID        = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL    = os.getenv("DATABASE_URL", "")
 REPEATERBOOK_API_KEY = os.getenv("REPEATERBOOK_API_KEY", "")
+NOAA_GEOMAG_API_KEY  = os.getenv("NOAA_GEOMAG_API_KEY", "")
+FINDAHELPLINE_API_KEY = os.getenv("FINDAHELPLINE_API_KEY", "")
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1375,6 +1379,7 @@ async def triage_command(interaction: discord.Interaction, query: str) -> None:
 	app_commands.Choice(name="🚨 USGS Quakes", value="earthquake"),
 	app_commands.Choice(name="📍 Photon OSM", value="photon"),
 	app_commands.Choice(name="🦆 DuckDuckGo", value="duckduckgo"),
+	app_commands.Choice(name="📕 Dictionary", value="dictionary"),
 ])
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.guild_install()
@@ -1485,6 +1490,48 @@ async def datum_cmd(interaction: discord.Interaction, query: str, source: app_co
 		await interaction.followup.send(embed=make_embed(f"🦆 DDG BRIEFING: {query.upper()}", truncate_text(abstract, 3900), OREGON_GREEN), ephemeral=private)
 		return
 
+	if selected == "dictionary":
+		url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{urllib.parse.quote(query)}"
+		status, payload, text = await fetch_json_with_headers(url, {"User-Agent": "SquelchBot/1.0"})
+		if status != 200 or not isinstance(payload, list) or not payload:
+			desc = f"❌ **No definition found for `{query}`**\nEither the word is not in the dictionary or the API is currently unavailable."
+			await interaction.followup.send(embed=make_embed("📕 DATUM: DICTIONARY ERROR", desc, ERROR_RED), ephemeral=private)
+			return
+		
+		entry = payload[0]
+		word = entry.get("word", query).capitalize()
+		phonetic = entry.get("phonetic") or ""
+		if not phonetic and entry.get("phonetics"):
+			for ph in entry.get("phonetics", []):
+				if ph.get("text"):
+					phonetic = ph.get("text")
+					break
+		
+		desc = f"## 📕 {word} `{phonetic}`\n\n"
+		
+		meanings = entry.get("meanings", [])
+		for idx, meaning in enumerate(meanings[:3]):
+			pos = meaning.get("partOfSpeech", "N/A").upper()
+			desc += f"### *{pos}*\n"
+			defs = meaning.get("definitions", [])
+			for d_idx, d in enumerate(defs[:2]):
+				definition = d.get("definition", "")
+				example = d.get("example", "")
+				desc += f"> **{d_idx+1}.** {definition}\n"
+				if example:
+					desc += f"> *Example: \"{example}\"*\n"
+			desc += "\n"
+			
+		origin = entry.get("origin") or ""
+		if origin:
+			desc += f"**Origin:**\n> {origin}\n"
+			
+		await interaction.followup.send(
+			embed=make_embed(f"📕 DICTIONARY DEFINITION: {word.upper()}", truncate_text(desc, 3900), OREGON_GREEN),
+			ephemeral=private
+		)
+		return
+
 	if selected == "ai":
 		prompt = await compose_ai_prompt(interaction.user.id, query, "datum ai lookup")
 		await handle_ai_prompt(interaction, prompt, "🤖 DATUM: AI ANALYSIS", already_deferred=True)
@@ -1521,7 +1568,7 @@ async def gps_cmd(interaction: discord.Interaction, location: str) -> None:
 @app_commands.user_install()
 async def weather_cmd(interaction: discord.Interaction, lat: float, lon: float) -> None:
 	await interaction.response.defer()
-	models = [("ECMWF","ecmwf_ifs"),("NOAA GFS","gfs_seamless"),("BOM ACCESS","bom_access_global")]
+	models = [("ECMWF","ecmwf_ifs025"),("NOAA GFS","gfs_seamless"),("BOM ACCESS","bom_access")]
 	rows: List[Tuple[str, Dict[str, Any]]] = []
 	errors: List[str] = []
 	for label, model in models:
@@ -1552,91 +1599,89 @@ async def weather_cmd(interaction: discord.Interaction, lat: float, lon: float) 
 	)
 
 
-@bot.tree.command(name="solardata", description="Space weather and HF propagation analytics.")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.guild_install()
-@app_commands.user_install()
-async def solardata_cmd(interaction: discord.Interaction) -> None:
-	desc = (
-		"**Solar Condition Snapshot**\n\n"
-		"— **Solar Flux (SFI):** 132\n— **K-index (Kp):** 3.0\n— **A-index:** 11\n"
-		"— **Sunspot trend:** moderate, stable active region\n— **HF noise floor:** quiet to moderate\n\n"
-		"**Propagation Guidance**\n"
-		"— **80m / 40m:** reliable for regional NVIS and nighttime contacts\n"
-		"— **30m / 20m:** solid daytime and grayline utility\n"
-		"— **17m / 15m:** open with current solar flux\n"
-		"— **10m / 6m:** intermittent — watch for sporadic-E\n\n"
-		"*Keep antenna takeoff angles low for DX. Monitor after geomagnetic disturbances.*"
-	)
-	embed = make_embed("☀️ SPACE WEATHER FIELD REPORT", desc, OREGON_GREEN, timestamp=True)
-	embed.add_field(name="Telemetry",  value="SFI 132 | Kp 3 | A 11", inline=True)
-	embed.add_field(name="Best Bands", value="80m, 40m, 20m, 17m",     inline=True)
-	await interaction.response.send_message(embed=embed, view=SolarDataView())
-
-
-@bot.tree.command(name="time", description="Synchronized Zulu clock core.")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.guild_install()
-@app_commands.user_install()
-async def time_cmd(interaction: discord.Interaction) -> None:
-	now = utc_now()
-	desc = (
-		f"**Zulu Time:** `{now.strftime('%H:%M:%S')}Z`\n"
-		f"**Date:** `{now.strftime('%Y-%m-%d')}`\n"
-		f"**Julian Day:** `{julian_day(now):.5f}`\n"
-		f"**Weekday:** `{now.strftime('%A')}`\n"
-		f"**Tracking window:** `0000Z → 2359Z`"
-	)
-	await interaction.response.send_message(embed=make_embed("🕐 CLOCK CORE ONLINE", desc, OREGON_GREEN, timestamp=True))
-
-
-@bot.tree.command(name="convert", description="Backcountry unit conversion engine.")
-@app_commands.describe(value="Number to convert.", unit_type="Unit type.")
-@app_commands.choices(unit_type=[
-	app_commands.Choice(name="🧗 Ewbank → YDS / French", value="ewbank"),
-	app_commands.Choice(name="📏 Meters → Feet",          value="meters"),
-	app_commands.Choice(name="⚖️ Grams → Ounces",        value="grams"),
-	app_commands.Choice(name="💧 Liters → Fluid Oz",     value="liters"),
-	app_commands.Choice(name="💵 AUD → USD",              value="aud"),
+@bot.tree.command(name="trailcalc", description="Tobler, Pandolf, and Naismith route planner.")
+@app_commands.describe(
+	distance_km="Route distance in km.", 
+	elevation_gain_m="Total elevation gain in metres.", 
+	weight_kg="Your body weight in kg.", 
+	pack_weight_kg="Pack weight in kg.",
+	terrain="Terrain factor selection.",
+	rest_window_hrs="Optional tactical rest window adjustments in hours."
+)
+@app_commands.choices(terrain=[
+	app_commands.Choice(name="🟢 Paved road / Boardwalk (1.0)", value="1.0"),
+	app_commands.Choice(name="🟡 Gravel / Dirt road (1.1)", value="1.1"),
+	app_commands.Choice(name="🟠 Light brush / Meadow (1.2)", value="1.2"),
+	app_commands.Choice(name="🔴 Heavy brush / Rocks (1.6)", value="1.6"),
+	app_commands.Choice(name="🏜️ Loose sand / Scree (2.1)", value="2.1"),
+	app_commands.Choice(name="❄️ Deep snowpack (3.3)", value="3.3")
 ])
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.guild_install()
 @app_commands.user_install()
-async def convert_cmd(interaction: discord.Interaction, value: float, unit_type: app_commands.Choice[str]) -> None:
-	unit = unit_type.value
-	if unit == "ewbank":
-		yds, french = ewbank_conversion(value)
-		desc = f"**Ewbank:** `{value:.1f}`\n**YDS:** `{yds}`\n**French:** `{french}`"
-	elif unit == "meters":
-		desc = f"**Meters:** `{value:.2f}`\n**Feet:** `{value * 3.28084:.2f}`"
-	elif unit == "grams":
-		desc = f"**Grams:** `{value:.2f}`\n**Ounces:** `{value / 28.3495:.2f}`"
-	elif unit == "liters":
-		desc = f"**Liters:** `{value:.2f}`\n**US Fluid Oz:** `{value * 33.814:.2f}`"
-	else:
-		desc = f"**AUD:** `{value:.2f}`\n**USD:** `{value * 0.66:.2f}` *(rate: 0.66)*"
-	await interaction.response.send_message(embed=make_embed("⚙️ CONVERSION TELEMETRY", desc, OREGON_GREEN))
-
-
-@bot.tree.command(name="trailcalc", description="Naismith's Rule route planner.")
-@app_commands.describe(distance_km="Route distance in km.", elevation_gain_m="Total elevation gain in metres.", weight_kg="Your body weight in kg.", pack_weight_kg="Pack weight in kg.")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.guild_install()
-@app_commands.user_install()
-async def trailcalc_cmd(interaction: discord.Interaction, distance_km: float, elevation_gain_m: float, weight_kg: float, pack_weight_kg: float) -> None:
-	hours    = (distance_km / 5.0) + (elevation_gain_m / 600.0)
-	hydro    = hours * 0.5
+async def trailcalc_cmd(
+	interaction: discord.Interaction, 
+	distance_km: float, 
+	elevation_gain_m: float, 
+	weight_kg: float, 
+	pack_weight_kg: float,
+	terrain: Optional[app_commands.Choice[str]] = None,
+	rest_window_hrs: float = 0.0
+) -> None:
+	# 1. Naismith baseline
+	hours_naismith = (distance_km / 5.0) + (elevation_gain_m / 600.0)
+	hydro_naismith = hours_naismith * 0.5
 	total_kg = weight_kg + pack_weight_kg
-	cals     = 6.0 * 3.5 * total_kg / 200.0 * (hours * 60.0)
+	cals_naismith = 6.0 * 3.5 * total_kg / 200.0 * (hours_naismith * 60.0)
+	
+	# 2. Tobler's formula
+	slope_fraction = elevation_gain_m / (distance_km * 1000.0) if distance_km > 0 else 0
+	speed_tobler = 6.0 * math.exp(-3.5 * abs(slope_fraction + 0.05))
+	hours_tobler = distance_km / speed_tobler if speed_tobler > 0 else 0
+	
+	# 3. Pandolf load carriage
+	eta = float(terrain.value) if terrain else 1.1  # default to dirt/gravel road if unselected
+	V = speed_tobler / 3.6  # walking velocity in m/s
+	G = slope_fraction * 100.0  # grade in percent
+	
+	ratio = (pack_weight_kg / weight_kg) if weight_kg > 0 else 0
+	# M = 1.5W + 2.0(W+L)(L/W)^2 + eta(W+L)(1.5V^2 + 0.35VG)
+	M_moving = 1.5 * weight_kg + 2.0 * (weight_kg + pack_weight_kg) * (ratio ** 2) + eta * (weight_kg + pack_weight_kg) * (1.5 * (V ** 2) + 0.35 * V * G)
+	
+	cals_moving = M_moving * 0.8604 * hours_tobler
+	
+	M_standing = 1.5 * weight_kg + 2.0 * (weight_kg + pack_weight_kg) * (ratio ** 2)
+	cals_rest = M_standing * 0.8604 * max(0.0, rest_window_hrs)
+	
+	cals_pandolf = cals_moving + cals_rest
+	
+	terrain_label = terrain.name if terrain else "Gravel / Dirt road (1.1, Default)"
+	
 	desc = (
-		f"**Moving Time (Naismith):** `{hours:.2f} hrs`\n"
-		f"**Hydration Est.:** `{hydro:.2f} L`\n"
-		f"**Calorie Expenditure:** `{cals:.0f} kcal`\n"
-		f"**Total Mass:** `{total_kg:.2f} kg`"
+		f"### 🥾 Naismith Baseline (Standard)\n"
+		f"— **Moving Time:** `{hours_naismith:.2f} hrs`\n"
+		f"— **Est. Hydration:** `{hydro_naismith:.2f} L`\n"
+		f"— **Energy Cost:** `{cals_naismith:.0f} kcal`\n\n"
+		
+		f"### 📈 Tobler Exponential Model\n"
+		f"— **Moving Time:** `{hours_tobler:.2f} hrs`\n"
+		f"— **Calculated Speed:** `{speed_tobler:.2f} km/h`\n"
+		f"— **Slope Grade:** `{G:.1f}%` ({elevation_gain_m:.0f}m gain)\n\n"
+		
+		f"### 🪖 Pandolf Military Load Carriage\n"
+		f"— **Terrain Factor (η):** {terrain_label}\n"
+		f"— **Tactical Rest Window:** `{rest_window_hrs:.2f} hrs`\n"
+		f"— **Metabolic Rate:** `{M_moving:.1f} Watts`\n"
+		f"— **Total Expenditure:** `{cals_pandolf:.0f} kcal` *(Moving + Rest)*\n\n"
+		f"*Total Mass: {total_kg:.2f} kg (Body: {weight_kg}kg, Load: {pack_weight_kg}kg)*"
 	)
+	
 	view = discord.ui.View(timeout=120)
 	view.add_item(discord.ui.Button(label="🗺️ CalTopo", url="https://caltopo.com/", style=discord.ButtonStyle.link))
-	await interaction.response.send_message(embed=make_embed("🥾 TRAIL ROUTE PLANNER", desc, OREGON_GREEN), view=view)
+	await interaction.response.send_message(
+		embed=make_embed("🥾 TRAIL ROUTE PLANNER", desc, OREGON_GREEN), 
+		view=view
+	)
 
 
 @bot.tree.command(name="pack", description="Backpack base-weight analyser.")
@@ -1657,6 +1702,194 @@ async def pack_cmd(interaction: discord.Interaction, base_weight_lbs: float) -> 
 	await interaction.response.send_message(embed=make_embed("🎒 PACK TELEMETRY", desc, color), view=view)
 
 
+
+@bot.tree.command(name="lighterpack", description="Scrape and analyze a shared LighterPack list.")
+@app_commands.describe(
+	url="LighterPack share URL (e.g., https://lighterpack.com/r/XXXXXX)",
+	ai_shakedown="Request an AI gear audit from Gemini."
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def lighterpack_cmd(interaction: discord.Interaction, url: str, ai_shakedown: bool = False) -> None:
+	private = await current_visibility(interaction.user.id)
+	await interaction.response.defer(ephemeral=private)
+
+	url = url.strip()
+	if "lighterpack.com/r/" not in url:
+		embed = make_embed(
+			"❌ INVALID LINK",
+			"Please provide a valid LighterPack share link (containing `lighterpack.com/r/`).",
+			ERROR_RED,
+			timestamp=True
+		)
+		await interaction.followup.send(embed=embed, ephemeral=private)
+		return
+
+	headers = {
+		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)"
+	}
+	status, text = await http_get_text(url, headers)
+	if status != 200 or not text:
+		embed = make_embed(
+			"❌ FETCH FAILED",
+			f"Could not retrieve the LighterPack page. HTTP Status: {status}",
+			ERROR_RED,
+			timestamp=True
+		)
+		await interaction.followup.send(embed=embed, ephemeral=private)
+		return
+
+	parts = text.split('<li class="lpItem')
+	if len(parts) <= 1:
+		embed = make_embed(
+			"❌ PARSING ERROR",
+			"No gear items found. Make sure the list is public and contains items.",
+			ERROR_RED,
+			timestamp=True
+		)
+		await interaction.followup.send(embed=embed, ephemeral=private)
+		return
+
+	items = []
+	for part in parts[1:]:
+		id_match = re.match(r'\s*([^"]+)"', part)
+		if not id_match:
+			continue
+		item_id = id_match.group(1).strip()
+		
+		name_match = re.search(r'class="lpName"[^>]*>\s*(.*?)\s*</span>', part, re.DOTALL)
+		name = name_match.group(1).strip() if name_match else "N/A"
+		name = re.sub(r'<[^>]+>', '', name).strip()
+		
+		mg_match = re.search(r'class="lpMG" value="(\d+)"', part)
+		mg = int(mg_match.group(1)) if mg_match else 0
+		
+		qty_match = re.search(r'class="lpQtyCell[^"]*"[^>]*>\s*(\d+)\s*</span>', part)
+		qty = int(qty_match.group(1)) if qty_match else 1
+		
+		worn_match = re.search(r'class="([^"]*lpWorn[^"]*)"', part)
+		cons_match = re.search(r'class="([^"]*lpConsumable[^"]*)"', part)
+		
+		worn = False
+		if worn_match:
+			wc = worn_match.group(1)
+			if "lpActive" in wc:
+				worn = True
+				
+		consumable = False
+		if cons_match:
+			cc = cons_match.group(1)
+			if "lpActive" in cc:
+				consumable = True
+				
+		items.append({
+			"id": item_id,
+			"name": name,
+			"weight_mg": mg,
+			"qty": qty,
+			"worn": worn,
+			"consumable": consumable
+		})
+
+	base_weight = 0.0
+	cons_weight = 0.0
+	worn_weight = 0.0
+
+	for item in items:
+		w = (item["weight_mg"] * item["qty"]) / 1000.0
+		if item["worn"]:
+			worn_weight += w
+		elif item["consumable"]:
+			cons_weight += w
+		else:
+			base_weight += w
+
+	base_weight_lbs = base_weight / 453.592
+	cons_weight_lbs = cons_weight / 453.592
+	worn_weight_lbs = worn_weight / 453.592
+	total_pack_lbs = base_weight_lbs + cons_weight_lbs
+
+	if base_weight_lbs < 10.0:
+		category = "Ultralight"
+		color = OREGON_GREEN
+	elif base_weight_lbs <= 20.0:
+		category = "Lightweight"
+		color = OREGON_GREEN
+	else:
+		category = "Traditional"
+		color = SAR_ORANGE
+
+	desc = (
+		f"🎒 **[PACK TELEMETRY ACTIVE]**\n"
+		f"Successfully scraped **{len(items)}** gear items from [LighterPack List]({url}).\n\n"
+		f"**Base Weight:** `{base_weight / 1000.0:.3f} kg` ({base_weight_lbs:.2f} lbs)\n"
+		f"**Consumables:** `{cons_weight / 1000.0:.3f} kg` ({cons_weight_lbs:.2f} lbs)\n"
+		f"**Worn Weight:** `{worn_weight / 1000.0:.3f} kg` ({worn_weight_lbs:.2f} lbs)\n"
+		f"**Total Pack Load:** `{(base_weight + cons_weight) / 1000.0:.3f} kg` ({total_pack_lbs:.2f} lbs)\n"
+		f"**Classification:** `{category}`\n"
+	)
+
+	view = discord.ui.View(timeout=120)
+	view.add_item(discord.ui.Button(label="🎒 View LighterPack", url=url, style=discord.ButtonStyle.link))
+
+	if not ai_shakedown:
+		embed = make_embed("🎒 LIGHTERPACK TELEMETRY", desc, color, timestamp=True)
+		await interaction.followup.send(embed=embed, view=view, ephemeral=private)
+		return
+
+	desc += "\n*Requesting AI gear shakedown from Gemini...*"
+	status_msg = await interaction.followup.send(embed=make_embed("🎒 LIGHTERPACK TELEMETRY", desc, color, timestamp=True), view=view, ephemeral=private)
+
+	items_str = ""
+	for idx, item in enumerate(items):
+		w_unit = "g"
+		w_val = item["weight_mg"] / 1000.0
+		if w_val >= 1000.0:
+			w_val /= 1000.0
+			w_unit = "kg"
+		status_str = []
+		if item["worn"]:
+			status_str.append("worn")
+		if item["consumable"]:
+			status_str.append("consumable")
+		status_desc = f" ({', '.join(status_str)})" if status_str else ""
+		items_str += f"{idx+1}. {item['name']} - {w_val:.2f}{w_unit} x {item['qty']}{status_desc}\n"
+
+	prompt = (
+		"You are an expert backcountry gear auditor and ultralight backpacking consultant. "
+		"Analyze the following packing list and provide a concise gear shakedown (audit) report. "
+		"Identify potential areas to save weight, point out redundant items, recommend lighter alternatives for heavy items, "
+		"and offer general suggestions for safety, comfort, or weight efficiency. Keep your tone helpful, professional, and practical.\n\n"
+		"### Packing List Summary\n"
+		f"- Base Weight: {base_weight / 1000.0:.3f} kg ({base_weight_lbs:.2f} lbs)\n"
+		f"- Consumables: {cons_weight / 1000.0:.3f} kg ({cons_weight_lbs:.2f} lbs)\n"
+		f"- Worn Weight: {worn_weight / 1000.0:.3f} kg ({worn_weight_lbs:.2f} lbs)\n"
+		f"- Classification: {category}\n\n"
+		"### Gear List\n"
+		f"{items_str}\n\n"
+		"Format your suggestions cleanly in Markdown, using bullet points and brief headers. Limit the response to ~400 words maximum."
+	)
+
+	success, ai_response = await gemini_generate(prompt)
+	if not success:
+		ai_response = f"⚠️ *AI Shakedown query failed: {ai_response}*"
+
+	desc_with_ai = (
+		f"🎒 **[PACK TELEMETRY ACTIVE]**\n"
+		f"Scraped **{len(items)}** gear items from [LighterPack List]({url}).\n\n"
+		f"**Base Weight:** `{base_weight / 1000.0:.3f} kg` ({base_weight_lbs:.2f} lbs)\n"
+		f"**Consumables:** `{cons_weight / 1000.0:.3f} kg` ({cons_weight_lbs:.2f} lbs)\n"
+		f"**Worn Weight:** `{worn_weight / 1000.0:.3f} kg` ({worn_weight_lbs:.2f} lbs)\n"
+		f"**Total Pack Load:** `{(base_weight + cons_weight) / 1000.0:.3f} kg` ({total_pack_lbs:.2f} lbs)\n"
+		f"**Classification:** `{category}`\n\n"
+		f"### 🤖 GEMINI AI GEAR AUDIT\n{ai_response}"
+	)
+	
+	embed = make_embed("🎒 LIGHTERPACK TELEMETRY", truncate_text(desc_with_ai, 4000), color, timestamp=True)
+	await status_msg.edit(embed=embed, view=view)
+
+
 @bot.tree.command(name="morse", description="Translate text into Morse code.")
 @app_commands.describe(text="Text to encode.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -1668,81 +1901,335 @@ async def morse_cmd(interaction: discord.Interaction, text: str) -> None:
 	await interaction.response.send_message(embed=make_embed("📡 MORSE CODE", desc, OREGON_GREEN))
 
 
-@bot.tree.command(name="repeater", description="VHF/UHF repeater directory tracker.")
-@app_commands.describe(location="Place name or coordinates search radius focus.")
+class ConversionDropdown(discord.ui.Select):
+	def __init__(self):
+		options = [
+			discord.SelectOption(label="🧗 Climb Rating (Ewbank)", value="climb", description="Convert climbing grades (Ewbank, YDS, French)"),
+			discord.SelectOption(label="📏 Distance (Meters/Feet)", value="distance", description="Convert meters <=> feet"),
+			discord.SelectOption(label="⚖️ Mass (Grams/Ounces)", value="mass", description="Convert grams <=> ounces"),
+			discord.SelectOption(label="💧 Volume (Liters/Fluid Oz)", value="volume", description="Convert liters <=> fluid ounces"),
+			discord.SelectOption(label="💵 Currency (AUD/USD)", value="currency", description="Convert AUD <=> USD")
+		]
+		super().__init__(placeholder="Select a category to convert...", min_values=1, max_values=1, options=options)
+
+	async def callback(self, interaction: discord.Interaction):
+		category = self.values[0]
+		modal = ConversionModal(category)
+		await interaction.response.send_modal(modal)
+
+
+class ConversionDashboardView(discord.ui.View):
+	def __init__(self):
+		super().__init__(timeout=180)
+		self.add_item(ConversionDropdown())
+
+
+class ConversionModal(discord.ui.Modal):
+	def __init__(self, category: str):
+		self.category = category
+		title = f"Convert {category.capitalize()}"
+		super().__init__(title=title)
+		
+		if category == "climb":
+			val_label = "Ewbank Grade (e.g. 18)"
+			unit_label = "Source Unit (defaults to 'ewbank')"
+			unit_default = "ewbank"
+		elif category == "distance":
+			val_label = "Value to convert"
+			unit_label = "Source Unit ('m' or 'ft')"
+			unit_default = "m"
+		elif category == "mass":
+			val_label = "Value to convert"
+			unit_label = "Source Unit ('g' or 'oz')"
+			unit_default = "g"
+		elif category == "volume":
+			val_label = "Value to convert"
+			unit_label = "Source Unit ('l' or 'oz')"
+			unit_default = "l"
+		else:
+			val_label = "Value to convert"
+			unit_label = "Source Unit ('aud' or 'usd')"
+			unit_default = "aud"
+			
+		self.value_input = discord.ui.TextInput(
+			label=val_label,
+			placeholder="Enter numeric value...",
+			required=True
+		)
+		self.unit_input = discord.ui.TextInput(
+			label=unit_label,
+			placeholder=f"e.g. {unit_default}",
+			default=unit_default,
+			required=False
+		)
+		self.add_item(self.value_input)
+		self.add_item(self.unit_input)
+
+	async def on_submit(self, interaction: discord.Interaction):
+		try:
+			val_str = self.value_input.value.strip()
+			value = float(val_str)
+		except ValueError:
+			await interaction.response.send_message("❌ Invalid number entered.", ephemeral=True)
+			return
+			
+		unit = self.unit_input.value.strip().lower() if self.unit_input.value else ""
+		title_label = "⚙️ CONVERSION RESULT"
+		desc = ""
+		
+		if self.category == "climb":
+			yds, french = ewbank_conversion(value)
+			desc = (
+				f"**Category:** Climbing Grades\n"
+				f"**Source Ewbank:** `{value:.1f}`\n"
+				f"— **YDS:** `{yds}`\n"
+				f"— **French:** `{french}`"
+			)
+		elif self.category == "distance":
+			if unit in ["ft", "feet", "foot"]:
+				converted = value / 3.28084
+				desc = (
+					f"**Category:** Distance\n"
+					f"**Source:** `{value:.2f} ft`\n"
+					f"— **Meters:** `{converted:.2f} m`"
+				)
+			else:
+				converted = value * 3.28084
+				desc = (
+					f"**Category:** Distance\n"
+					f"**Source:** `{value:.2f} m`\n"
+					f"— **Feet:** `{converted:.2f} ft`"
+				)
+		elif self.category == "mass":
+			if unit in ["oz", "ounces", "ounce"]:
+				converted = value * 28.3495
+				desc = (
+					f"**Category:** Mass\n"
+					f"**Source:** `{value:.2f} oz`\n"
+					f"— **Grams:** `{converted:.2f} g`"
+				)
+			else:
+				converted = value / 28.3495
+				desc = (
+					f"**Category:** Mass\n"
+					f"**Source:** `{value:.2f} g`\n"
+					f"— **Ounces:** `{converted:.2f} oz`"
+				)
+		elif self.category == "volume":
+			if unit in ["oz", "fl oz", "fluid oz", "ounces"]:
+				converted = value / 33.814
+				desc = (
+					f"**Category:** Volume\n"
+					f"**Source:** `{value:.2f} fl oz`\n"
+					f"— **Liters:** `{converted:.2f} L`"
+				)
+			else:
+				converted = value * 33.814
+				desc = (
+					f"**Category:** Volume\n"
+					f"**Source:** `{value:.2f} L`\n"
+					f"— **Fluid Oz:** `{converted:.2f} fl oz`"
+				)
+		elif self.category == "currency":
+			if unit in ["usd", "$"]:
+				converted = value / 0.66
+				desc = (
+					f"**Category:** Currency\n"
+					f"**Source:** `${value:.2f} USD`\n"
+					f"— **AUD:** `${converted:.2f} AUD` *(rate: 0.66)*"
+				)
+			else:
+				converted = value * 0.66
+				desc = (
+					f"**Category:** Currency\n"
+					f"**Source:** `${value:.2f} AUD`\n"
+					f"— **USD:** `${converted:.2f} USD` *(rate: 0.66)*"
+				)
+				
+		embed = make_embed(title_label, desc, OREGON_GREEN, timestamp=True)
+		await interaction.response.edit_message(embed=embed, view=ConversionDashboardView())
+
+
+@bot.tree.command(name="convert", description="Backcountry unit conversion engine.")
+@app_commands.describe(
+	value="Number to convert.",
+	unit_type="Unit type category.",
+	interface_mode="Use direct response or interactive dashboard embed."
+)
+@app_commands.choices(
+	unit_type=[
+		app_commands.Choice(name="🧗 Ewbank → YDS / French", value="ewbank"),
+		app_commands.Choice(name="📏 Meters → Feet", value="meters"),
+		app_commands.Choice(name="⚖️ Grams → Ounces", value="grams"),
+		app_commands.Choice(name="💧 Liters → Fluid Oz", value="liters"),
+		app_commands.Choice(name="💵 AUD → USD", value="aud")
+	],
+	interface_mode=[
+		app_commands.Choice(name="Direct Text Response", value="direct"),
+		app_commands.Choice(name="Interactive Dashboard", value="embed")
+	]
+)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.guild_install()
 @app_commands.user_install()
-async def repeater_cmd(interaction: discord.Interaction, location: str) -> None:
-	if REPEATERBOOK_API_KEY:
-		await interaction.response.defer()
-		url = f"https://www.repeaterbook.com/api/export.php?state={urllib.parse.quote(location)}&type=json"
-		headers = {"Authorization": f"Bearer {REPEATERBOOK_API_KEY}"}
-		status, payload, text = await fetch_json_with_headers(url, headers)
+async def convert_cmd(
+	interaction: discord.Interaction,
+	value: Optional[float] = None,
+	unit_type: Optional[app_commands.Choice[str]] = None,
+	interface_mode: str = "direct"
+) -> None:
+	if interface_mode == "direct" and value is not None and unit_type is not None:
+		unit = unit_type.value
+		if unit == "ewbank":
+			yds, french = ewbank_conversion(value)
+			desc = f"**Ewbank:** `{value:.1f}`\n**YDS:** `{yds}`\n**French:** `{french}`"
+		elif unit == "meters":
+			desc = f"**Meters:** `{value:.2f}`\n**Feet:** `{value * 3.28084:.2f}`"
+		elif unit == "grams":
+			desc = f"**Grams:** `{value:.2f}`\n**Ounces:** `{value / 28.3495:.2f}`"
+		elif unit == "liters":
+			desc = f"**Liters:** `{value:.2f}`\n**US Fluid Oz:** `{value * 33.814:.2f}`"
+		else:
+			desc = f"**AUD:** `{value:.2f}`\n**USD:** `{value * 0.66:.2f}` *(rate: 0.66)*"
+		await interaction.response.send_message(embed=make_embed("⚙️ CONVERSION TELEMETRY", desc, OREGON_GREEN))
+		return
 		
-		if status == 200 and isinstance(payload, list) and payload:
-			rep = payload[0]
-			desc = (
-				f"🛰️ **[LIVE REPEATERBOOK FEED ACTIVE]**\n\n"
-				f"**Frequency Out:** `{rep.get('frequency', 'N/A')} MHz`\n"
-				f"**Input In:** `{rep.get('input_freq', 'N/A')} MHz`\n"
-				f"**Callsign:** `{rep.get('callsign', 'N/A')}`\n"
-				f"**Offset:** `{rep.get('offset', 'N/A')}`\n"
-				f"**PL Tone:** `{rep.get('pl_tone', 'N/A')} Hz`\n"
-				f"**Notes:** {rep.get('notes', 'No specific details returned.')}"
-			)
-			await interaction.followup.send(embed=make_embed("📡 LIVE REPEATER CHANNEL SEARCH", desc, OREGON_GREEN), view=RepeaterLinksView(location))
-			return
-
-	coords  = parse_query_location(location)
-	lat     = coords[0] if coords else None
-	lon     = coords[1] if coords else None
-	profile = repeater_profile(location, lat, lon)
-	desc = (
-		f"📻 **[SIMULATED REPEATER PROFILE]**\n"
-		f"*No active API token detected or query unmatched. displaying core calculation matrix prediction model.*\n\n"
-		f"**Coverage Area:** `{clean_text(location)}`\n"
-		f"**Callsign:** `{profile['callsign']}`\n"
-		f"**Output:** `{profile['output']}`\n"
-		f"**Input:** `{profile['input']}`\n"
-		f"**Offset:** `{profile['offset']}`\n"
-		f"**Tone:** `{profile['tone']}`\n"
-		f"**Field Note:** {profile['coverage']}"
+	view = ConversionDashboardView()
+	embed = make_embed(
+		"⚙️ CONVERSION DASHBOARD",
+		"Select a category below to perform conversions. This interface supports multi-unit conversions via modals.",
+		OREGON_GREEN
 	)
-	if interaction.response.is_done():
-		await interaction.followup.send(embed=make_embed("📻 REPEATER SIMULATION", desc, OREGON_GREEN), view=RepeaterLinksView(location))
-	else:
-		await interaction.response.send_message(embed=make_embed("📻 REPEATER SIMULATION", desc, OREGON_GREEN), view=RepeaterLinksView(location))
+	await interaction.response.send_message(embed=embed, view=view)
+
+
+@bot.tree.command(name="repeater", description="VHF/UHF repeater directory tracker.")
+@app_commands.describe(lat="Latitude (decimal).", lon="Longitude (decimal).", radius_km="Search radius in km.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def repeater_cmd(interaction: discord.Interaction, lat: float, lon: float, radius_km: float = 50.0) -> None:
+	private = await current_visibility(interaction.user.id)
+	
+	if not REPEATERBOOK_API_KEY:
+		embed = make_embed(
+			"❌ CONFIGURATION ERROR",
+			"The `REPEATERBOOK_API_KEY` configuration environment variable is missing. "
+			"Provide an API key to query the live RepeaterBook directory.",
+			ERROR_RED,
+			timestamp=True
+		)
+		await interaction.response.send_message(embed=embed, ephemeral=True)
+		return
+
+	await interaction.response.defer(ephemeral=private)
+
+	# Query RepeaterBook proximity API
+	url = f"https://www.repeaterbook.com/api/export.php?qtype=prox&lat={lat}&lng={lon}&dist={radius_km}&dunit=km"
+	headers = {
+		"X-RB-App-Token": REPEATERBOOK_API_KEY,
+		"User-Agent": "squelchbot/1.0 (discord bot for tracking and navigation; contact: operator@squelch.net)"
+	}
+	
+	try:
+		status, payload, text = await fetch_json_with_headers(url, headers)
+		if status == 200 and isinstance(payload, list) and len(payload) > 0:
+			# Format first 5 repeaters
+			lines = []
+			for idx, rep in enumerate(payload[:5]):
+				pl_tone = rep.get('pl_tone', 'N/A')
+				if pl_tone:
+					pl_tone = f"{pl_tone} Hz"
+				else:
+					pl_tone = "None"
+				lines.append(
+					f"**{idx+1}. {rep.get('callsign', 'N/A')}**\n"
+					f"— Output: `{rep.get('frequency', 'N/A')} MHz` | Input: `{rep.get('input_freq', 'N/A')} MHz` ({rep.get('offset', 'N/A')})\n"
+					f"— Tone: `{pl_tone}` | Location: `{rep.get('location', 'N/A')}, {rep.get('state', 'N/A')}`\n"
+					f"— Notes: {rep.get('notes', 'None')}"
+				)
+			desc = f"🛰️ **[LIVE REPEATERBOOK FEED ACTIVE]**\nFound {len(payload)} repeaters within {radius_km} km. Showing closest 5:\n\n" + "\n\n".join(lines)
+			await interaction.followup.send(
+				embed=make_embed("📡 LIVE REPEATER CHANNEL SEARCH", desc, OREGON_GREEN, timestamp=True),
+				view=RepeaterLinksView(f"{lat:.5f},{lon:.5f}"),
+				ephemeral=private
+			)
+			return
+	except Exception as e:
+		await write_error_log(f"RepeaterBook API error: {str(e)}")
+		
+	# Fallback/Empty message
+	desc = (
+		f"❌ **NO REPEATERS FOUND**\n"
+		f"No repeaters were returned within `{radius_km} km` of `{lat:.5f}, {lon:.5f}`. "
+		f"Verify the coordinates or try expanding your search radius."
+	)
+	await interaction.followup.send(
+		embed=make_embed("📡 LIVE REPEATER CHANNEL SEARCH", desc, ERROR_RED, timestamp=True),
+		view=RepeaterLinksView(f"{lat:.5f},{lon:.5f}"),
+		ephemeral=private
+	)
 
 
 @bot.tree.command(name="declination", description="Estimated magnetic declination for compass work.")
-@app_commands.describe(location="Place name or lat,lon.")
+@app_commands.describe(lat="Latitude (decimal).", lon="Longitude (decimal).")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.guild_install()
 @app_commands.user_install()
-async def declination_cmd(interaction: discord.Interaction, location: str) -> None:
-	coords = parse_query_location(location)
-	if coords:
-		lat, lon = coords
-		label = f"{lat:.5f}, {lon:.5f}"
-	else:
-		label = clean_text(location)
-		seed  = sum(ord(c) for c in label)
-		lat   = (seed % 180) - 90
-		lon   = ((seed * 3) % 360) - 180
-	dec    = approximate_declination(lat, lon)
-	hemi   = "east" if dec > 0 else "west"
+async def declination_cmd(interaction: discord.Interaction, lat: float, lon: float) -> None:
+	private = await current_visibility(interaction.user.id)
+	
+	if not NOAA_GEOMAG_API_KEY:
+		embed = make_embed(
+			"❌ CONFIGURATION ERROR",
+			"The `NOAA_GEOMAG_API_KEY` configuration environment variable is missing. "
+			"Provide a registered API key on Koyeb to enable live declination calculations.",
+			ERROR_RED,
+			timestamp=True
+		)
+		await interaction.response.send_message(embed=embed, ephemeral=True)
+		return
+
+	await interaction.response.defer(ephemeral=private)
+
+	url = f"https://www.ngdc.noaa.gov/geomag-web/calculators/calculateDeclination?lat1={lat}&lon1={lon}&key={NOAA_GEOMAG_API_KEY}&resultFormat=json"
+	
+	dec = None
+	fallback = False
+	
+	try:
+		status, payload, text = await fetch_json_with_headers(url, {"User-Agent": "SquelchBot/1.0"})
+		if status == 200 and isinstance(payload, dict) and "result" in payload:
+			results = payload["result"]
+			if isinstance(results, list) and len(results) > 0:
+				dec = float(results[0].get("declination", 0))
+	except Exception:
+		pass
+
+	if dec is None:
+		dec = (lat * 0.1) - (lon * 0.05)
+		fallback = True
+
+	hemi = "east" if dec > 0 else "west"
 	adjust = "subtract from true heading" if dec > 0 else "add to true heading"
+	
+	notice = "📡 **[LIVE NOAA DATA ACTIVE]**"
+	if fallback:
+		notice = "⚠️ **[LOCAL FALLBACK MATH ACTIVE]**\n*The NOAA API is currently offline or unreachable. Using trigonometric approximation.*"
+
 	desc = (
-		f"**Location:** `{label}`\n"
-		f"**Approximate Declination:** `{dec:+.1f}°`\n"
-		f"**Direction:** `{abs(dec):.1f}° {hemi}`\n"
+		f"{notice}\n\n"
+		f"**Coordinates:** `{lat:.5f}, {lon:.5f}`\n"
+		f"**Estimated Declination:** `{dec:+.2f}°`\n"
+		f"**Direction:** `{abs(dec):.2f}° {hemi}`\n"
 		f"**Compass Guideline:** {adjust}\n\n"
-		"*Operational estimate only — verify with an official chart for critical navigation.*"
+		f"*Verify with an official map or chart for critical navigation.*"
 	)
-	await interaction.response.send_message(
-		embed=make_embed("🧭 MAGNETIC DECLINATION", desc, OREGON_GREEN),
+	
+	await interaction.followup.send(
+		embed=make_embed("🧭 MAGNETIC DECLINATION", desc, OREGON_GREEN, timestamp=True),
 		view=DeclinationLinksView(),
+		ephemeral=private
 	)
 
 
@@ -1912,6 +2399,312 @@ async def verify_command(interaction: discord.Interaction, user: discord.User) -
 		timestamp=True
 	)
 	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+HELPLINES = {
+    "australia": {
+        "title": "🇦🇺 Critical National Services (All States)",
+        "categories": {
+            "🚨 Emergency Services": [
+                "Triple Zero (Emergency): 000 (Police, Fire, Ambulance — 24/7)",
+                "Police Assistance Line (Non-Emergency): 13 14 44",
+                "State Emergency Service (SES): 13 25 00 (Storm, flood, and natural disasters)"
+            ],
+            "🏛️ Medicare & Government Services": [
+                "Medicare Public Enquiries: 13 20 11 (General Medicare account help)",
+                "My Health Record Helpline: 1800 723 471",
+                "Centrelink (Employment Services): 13 28 50"
+            ],
+            "🩺 National Medical & Health Advice": [
+                "Healthdirect / 1800MEDICARE: 1800 022 222 (24/7 registered nurse triage — known nationally as 1800MEDICARE, except VIC)",
+                "Poisons Information Centre: 13 11 26 (24/7 advice on overdoses, bites, or toxins)",
+                "National Coronavirus Helpline: 1800 020 080"
+            ],
+            "🧠 National Mental Health & Crisis Lines (24/7)": [
+                "Lifeline: 13 11 14 (Crisis support and suicide prevention)",
+                "Beyond Blue: 1300 22 4636",
+                "Medicare Mental Health Phone Service: 1800 595 212 (Mon-Fri 8:30am–5pm)",
+                "13YARN: 13 92 76 (Crisis support for Aboriginal and Torres Strait Islander people)",
+                "Kids Helpline: 1800 55 1800 (For youth aged 5–25)",
+                "Suicide Call Back Service: 1300 659 467",
+                "MensLine Australia: 1300 78 99 78",
+                "1800RESPECT: 1800 737 732 (Domestic, family, and sexual violence support)"
+            ]
+        },
+        "states": {
+            "nsw": [
+                "Medical Triage: 1800 022 222 (Healthdirect NSW)",
+                "Mental Health Line: 1800 011 511 (24/7 state-wide triage)"
+            ],
+            "vic": [
+                "Medical Triage: 1300 60 60 24 (NURSE-ON-CALL Victoria)",
+                "Mental Health Crisis Line: 1300 651 251 (Suicide Help Line / Triage)",
+                "SuicideLine Victoria: 1300 651 251"
+            ],
+            "qld": [
+                "Medical Triage: 13 43 25 84 (13 HEALTH QLD — alternate 13 43 25)",
+                "Mental Health Line: 1300 64 22 55 (1300 MH CALL)"
+            ],
+            "sa": [
+                "Medical Triage: 1800 022 222 (Healthdirect SA)",
+                "Mental Health Line: 13 14 65 (Mental Health Triage Service)"
+            ],
+            "wa": [
+                "Medical Triage: 1800 022 222 (Healthdirect WA)",
+                "Mental Health Line (Metro): 1300 555 788 (Mental Health Emergency Response Line)",
+                "Mental Health Line (Peel Region): 1800 676 822",
+                "Mental Health Line (Rurallink): 1800 552 002"
+            ],
+            "tas": [
+                "Medical Triage: 1800 022 222 (Healthdirect TAS)",
+                "Mental Health Line: 1800 332 388 (Access Mental Health Helpline)"
+            ],
+            "act": [
+                "Medical Triage: 1800 022 222 (Healthdirect ACT)",
+                "Mental Health Line: 1800 629 354 (Access Mental Health Triage)"
+            ],
+            "nt": [
+                "Medical Triage: 1800 022 222 (Healthdirect NT)",
+                "Mental Health Line: 1800 682 288 (NT Mental Health Line)"
+            ]
+        }
+    },
+    "united_states": {
+        "title": "🇺🇸 United States Core Helplines",
+        "categories": {
+            "🚨 Primary Response": [
+                "Emergency Services: 911 (24/7 Dispatch Core)",
+                "988 Suicide & Crisis Lifeline: 988 (24/7 Voice & Text Routing)"
+            ],
+            "☣️ Specialized Resources": [
+                "National Poison Help Line: 1-800-222-1222 (24/7 Toxin Mitigation)",
+                "SAMHSA National Helpline: 1-800-662-4357 (Substance Support Tracking)"
+            ]
+        }
+    },
+    "united_kingdom": {
+        "title": "🇬🇧 United Kingdom Core Helplines",
+        "categories": {
+            "🚨 Emergency & Safety": [
+                "Emergency Services: 999 or 112 (24/7 Fleet Dispatch)",
+                "Police Non-Emergency Assistance Network: 101"
+            ],
+            "🩺 Medical & Crisis Routing": [
+                "NHS Medical Triage Portal: 111 (Non-Emergency Advice)",
+                "Samaritans Crisis Support Network: 116 123"
+            ]
+        }
+    }
+}
+
+
+async def fetch_findahelpline_data(country_code: str, state_code: Optional[str] = None) -> Optional[List[str]]:
+	if not FINDAHELPLINE_API_KEY:
+		return None
+		
+	c_code = country_code.lower()
+	if c_code == "australia":
+		c_code = "au"
+	elif c_code == "united_states":
+		c_code = "us"
+	elif c_code == "united_kingdom":
+		c_code = "gb"
+		
+	url = f"https://api.findahelpline.com/v1/helplines?country_code={c_code}"
+	if state_code:
+		url += f"&state={state_code.lower()}"
+		
+	headers = {
+		"Authorization": f"Bearer {FINDAHELPLINE_API_KEY}",
+		"User-Agent": "SquelchBot/1.0"
+	}
+	
+	try:
+		status, payload, text = await fetch_json_with_headers(url, headers)
+		if status == 200 and isinstance(payload, list):
+			results = []
+			for item in payload[:10]:
+				name = item.get("name")
+				phones = item.get("phones", [])
+				phone_num = phones[0].get("number") if phones else None
+				if name and phone_num:
+					results.append(f"{name}: {phone_num}")
+			if results:
+				return results
+	except Exception:
+		pass
+	return None
+
+
+async def show_australia_dashboard(interaction: discord.Interaction, selected_state: Optional[str] = None, selected_category: Optional[str] = None):
+	api_data = None
+	if FINDAHELPLINE_API_KEY:
+		s_code = selected_state if (selected_state and selected_state != "national") else None
+		api_data = await fetch_findahelpline_data("australia", s_code)
+		
+	desc = "### 🇦🇺 Australia Crisis Registry\n"
+	
+	if api_data:
+		desc += "📡 **[LIVE THROUGHLINE API ACTIVE]**\n\n"
+		desc += "\n".join(f"• {item}" for item in api_data)
+	else:
+		desc += "🗃️ **[LOCAL DYNAMICS REGISTRY ACTIVE]**\n\n"
+		if selected_state and selected_state != "national":
+			desc += f"#### 📍 Regional Support ({selected_state.upper()})\n"
+			state_list = HELPLINES["australia"]["states"].get(selected_state, [])
+			desc += "\n".join(f"• {item}" for item in state_list) + "\n\n"
+			
+		cat_key = "🚨 Emergency Services"
+		if selected_category == "medicare":
+			cat_key = "🏛️ Medicare & Government Services"
+		elif selected_category == "medical":
+			cat_key = "🩺 National Medical & Health Advice"
+		elif selected_category == "mental":
+			cat_key = "🧠 National Mental Health & Crisis Lines (24/7)"
+			
+		desc += f"#### {cat_key}\n"
+		cat_list = HELPLINES["australia"]["categories"].get(cat_key, [])
+		desc += "\n".join(f"• {item}" for item in cat_list)
+		
+	embed = make_embed("🇦🇺 AUSTRALIA SUPPORT HUB", desc, OREGON_GREEN, timestamp=True)
+	await interaction.response.edit_message(embed=embed, view=HelplineAustraliaView(selected_state))
+
+
+async def show_us_dashboard(interaction: discord.Interaction):
+	api_data = None
+	if FINDAHELPLINE_API_KEY:
+		api_data = await fetch_findahelpline_data("united_states")
+		
+	desc = "### 🇺🇸 United States Crisis Registry\n"
+	
+	if api_data:
+		desc += "📡 **[LIVE THROUGHLINE API ACTIVE]**\n\n"
+		desc += "\n".join(f"• {item}" for item in api_data)
+	else:
+		desc += "🗃️ **[LOCAL DYNAMICS REGISTRY ACTIVE]**\n\n"
+		for cat, items in HELPLINES["united_states"]["categories"].items():
+			desc += f"#### {cat}\n"
+			desc += "\n".join(f"• {item}" for item in items) + "\n\n"
+			
+	embed = make_embed("🇺🇸 UNITED STATES SUPPORT HUB", desc, OREGON_GREEN, timestamp=True)
+	await interaction.response.edit_message(embed=embed, view=HelplineBackView())
+
+
+async def show_uk_dashboard(interaction: discord.Interaction):
+	api_data = None
+	if FINDAHELPLINE_API_KEY:
+		api_data = await fetch_findahelpline_data("united_kingdom")
+		
+	desc = "### 🇬🇧 United Kingdom Crisis Registry\n"
+	
+	if api_data:
+		desc += "📡 **[LIVE THROUGHLINE API ACTIVE]**\n\n"
+		desc += "\n".join(f"• {item}" for item in api_data)
+	else:
+		desc += "🗃️ **[LOCAL DYNAMICS REGISTRY ACTIVE]**\n\n"
+		for cat, items in HELPLINES["united_kingdom"]["categories"].items():
+			desc += f"#### {cat}\n"
+			desc += "\n".join(f"• {item}" for item in items) + "\n\n"
+			
+	embed = make_embed("🇬🇧 UNITED KINGDOM SUPPORT HUB", desc, OREGON_GREEN, timestamp=True)
+	await interaction.response.edit_message(embed=embed, view=HelplineBackView())
+
+
+class HelplineCountryView(discord.ui.View):
+	def __init__(self):
+		super().__init__(timeout=180)
+
+	@discord.ui.button(label="Australia 🇦🇺", style=discord.ButtonStyle.primary, custom_id="hl_au")
+	async def australia_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+		await show_australia_dashboard(interaction)
+
+	@discord.ui.button(label="United States 🇺🇸", style=discord.ButtonStyle.primary, custom_id="hl_us")
+	async def us_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+		await show_us_dashboard(interaction)
+
+	@discord.ui.button(label="United Kingdom 🇬🇧", style=discord.ButtonStyle.primary, custom_id="hl_uk")
+	async def uk_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+		await show_uk_dashboard(interaction)
+
+
+class HelplineAustraliaView(discord.ui.View):
+	def __init__(self, selected_state: Optional[str] = None):
+		super().__init__(timeout=180)
+		self.selected_state = selected_state
+		self.add_item(HelplineStateSelect(selected_state))
+		self.add_item(HelplineCategorySelect())
+
+	@discord.ui.button(label="⬅️ Back", style=discord.ButtonStyle.secondary, row=2)
+	async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+		embed = make_embed(
+			"🏥 HELPLINE DYNAMICS REGISTRY",
+			"Select a region below to retrieve critical emergency, medical, and mental health helpline contacts.",
+			OREGON_GREEN
+		)
+		await interaction.response.edit_message(embed=embed, view=HelplineCountryView())
+
+
+class HelplineStateSelect(discord.ui.Select):
+	def __init__(self, selected: Optional[str] = None):
+		options = [
+			discord.SelectOption(label="National / All States", value="national", default=(selected is None or selected == "national")),
+			discord.SelectOption(label="New South Wales (NSW)", value="nsw", default=(selected == "nsw")),
+			discord.SelectOption(label="Victoria (VIC)", value="vic", default=(selected == "vic")),
+			discord.SelectOption(label="Queensland (QLD)", value="qld", default=(selected == "qld")),
+			discord.SelectOption(label="Western Australia (WA)", value="wa", default=(selected == "wa")),
+			discord.SelectOption(label="South Australia (SA)", value="sa", default=(selected == "sa")),
+			discord.SelectOption(label="Tasmania (TAS)", value="tas", default=(selected == "tas")),
+			discord.SelectOption(label="ACT", value="act", default=(selected == "act")),
+			discord.SelectOption(label="Northern Territory (NT)", value="nt", default=(selected == "nt"))
+		]
+		super().__init__(placeholder="Select State for regional numbers...", min_values=1, max_values=1, options=options, row=0)
+
+	async def callback(self, interaction: discord.Interaction):
+		state = self.values[0]
+		await show_australia_dashboard(interaction, selected_state=state)
+
+
+class HelplineCategorySelect(discord.ui.Select):
+	def __init__(self):
+		options = [
+			discord.SelectOption(label="🚨 Emergency Services", value="emergency"),
+			discord.SelectOption(label="🏛️ Medicare & Government Services", value="medicare"),
+			discord.SelectOption(label="🩺 National Medical & Health Advice", value="medical"),
+			discord.SelectOption(label="🧠 National Mental Health & Crisis Lines", value="mental")
+		]
+		super().__init__(placeholder="Select National Category...", min_values=1, max_values=1, options=options, row=1)
+
+	async def callback(self, interaction: discord.Interaction):
+		category = self.values[0]
+		state = getattr(self.view, "selected_state", None)
+		await show_australia_dashboard(interaction, selected_state=state, selected_category=category)
+
+
+class HelplineBackView(discord.ui.View):
+	def __init__(self):
+		super().__init__(timeout=180)
+
+	@discord.ui.button(label="⬅️ Back", style=discord.ButtonStyle.secondary)
+	async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+		embed = make_embed(
+			"🏥 HELPLINE DYNAMICS REGISTRY",
+			"Select a region below to retrieve critical emergency, medical, and mental health helpline contacts.",
+			OREGON_GREEN
+		)
+		await interaction.response.edit_message(embed=embed, view=HelplineCountryView())
+
+
+@bot.tree.command(name="helpline", description="Access local and national support resources.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.guild_install()
+@app_commands.user_install()
+async def helpline_cmd(interaction: discord.Interaction) -> None:
+	embed = make_embed(
+		"🏥 HELPLINE DYNAMICS REGISTRY",
+		"Select a region below to retrieve critical emergency, medical, and mental health helpline contacts.",
+		OREGON_GREEN
+	)
+	await interaction.response.send_message(embed=embed, view=HelplineCountryView())
 
 
 # ═══════════════════════════════════════════════════════════════
